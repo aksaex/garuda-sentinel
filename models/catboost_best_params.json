@@ -1,0 +1,18 @@
+{
+  "model": "CatBoost",
+  "encoding": "native_cat_features",
+  "params": {
+    "iterations": 600,
+    "depth": 10,
+    "learning_rate": 0.17855789220062088,
+    "l2_leaf_reg": 0.01653693718282442,
+    "random_strength": 0.1465352103067214,
+    "bagging_temperature": 1.3684660530243138,
+    "border_count": 254,
+    "min_data_in_leaf": 2,
+    "scale_pos_weight": 0.7621195864233186
+  },
+  "cv_macro_f1": 0.9963291245187699,
+  "n_trials": 13,
+  "random_state": 42
+}
