@@ -1,0 +1,19 @@
+{
+  "proto": [
+    "icmp",
+    "tcp",
+    "udp"
+  ],
+  "service": [
+    "-",
+    "dhcp",
+    "dns",
+    "http",
+    "irc",
+    "mqtt",
+    "ntp",
+    "radius",
+    "ssh",
+    "ssl"
+  ]
+}

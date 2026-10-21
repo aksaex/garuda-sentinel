@@ -11,6 +11,13 @@ Preprocessing __wajib__ align dengan `feature_columns.json` yang
 dipakai saat training XGBoost. Categorical `proto` & `service`
 di-encode manual via `categorical_categories.json` agar tidak
 bergantung pada objek sklearn yang mungkin berbeda versi.
+
+Patch penting:
+- `xgb_filenames`: auto-detect xgb_known_threats.json atau xgboost_best.pkl
+- `_zero_non_informative()`: zero-kan id.orig_p/id.resp_p KHUSUS Layer-2
+  agar Isolation Forest tidak false-positive pada port ephemeral.
+- `_severity_from_iso()`: hitung severity dari magnitude decision_function
+  saat threshold == 0.0 (default sklearn IsolationForest offset).
 """
 from __future__ import annotations
 
@@ -38,7 +45,19 @@ LOGGER = logging.getLogger("garuda.detector")
 @dataclass
 class DetectorConfig:
     model_dir: Path = Path("models")
-    xgb_filename: str = "xgb_known_threats.json"
+
+    # Multi-kandidat: cari yang pertama ada
+    xgb_filenames: List[str] = field(default_factory=lambda: [
+        "xgb_known_threats.json",
+        "xgb_known_threats.ubj",
+        "xgb_known_threats.pkl",
+        "xgboost_best.json",
+        "xgboost_best.ubj",
+        "xgboost_best.pkl",
+        "model.json",
+        "model.pkl",
+    ])
+
     iso_filename: str = "isolation_forest.pkl"
     iso_scaler_filename: str = "isolation_scaler.pkl"
     iso_metadata_filename: str = "isolation_metadata.json"
@@ -58,7 +77,7 @@ class DetectorConfig:
     # fallback bila stream CSV tidak punya src_ip / dst_ip
     fallback_src_ip: str = "0.0.0.0"
     fallback_dst_ip: str = "0.0.0.0"
-    strict_ips: bool = False  # True => raise bila ip hilang
+    strict_ips: bool = False
 
 
 @dataclass
@@ -79,6 +98,13 @@ class DualLayerDetector:
 
     METADATA_KEYS = ("_stream_ts", "_row_index", "_loop_index")
 
+    # Fitur yang zero-kan KHUSUS untuk Layer-2 (bukan Layer-1).
+    NON_INFORMATIVE = {
+        "id.orig_p", "id.resp_p",
+        "unnamed: 0", "unnamed:0", "index",
+        "src_ip", "dst_ip", "src_port", "dst_port", "id",
+    }
+
     def __init__(
         self,
         artifacts: ModelArtifacts,
@@ -93,14 +119,12 @@ class DualLayerDetector:
         self._lower_to_actual: Dict[str, str] = {c.lower(): c for c in self._feature_columns}
         self._categorical = artifacts.categorical_categories
 
-        # threshold Isolation Forest
         iso_thr = config.iso_threshold_override
         if iso_thr is None:
             iso_thr = artifacts.iso_metadata.get("score_threshold", 0.0)
         self._iso_threshold = float(iso_thr)
         LOGGER.info("Isolation Forest threshold = %.6f", self._iso_threshold)
 
-        # validate category coverage vs feature_columns
         self._validate_category_columns()
 
     # ------------------------------------------------------------------ #
@@ -116,22 +140,63 @@ class DualLayerDetector:
         config = config or DetectorConfig()
         model_dir = Path(config.model_dir)
 
-        xgb_path = model_dir / config.xgb_filename
+        # --- cari XGBoost (multi-kandidat) ---
+        xgb_path: Optional[Path] = None
+        for fname in config.xgb_filenames:
+            p = model_dir / fname
+            if p.exists():
+                xgb_path = p
+                break
+        if xgb_path is None:
+            raise FileNotFoundError(
+                f"Model XGBoost tidak ditemukan di {model_dir}. "
+                f"Dicari: {config.xgb_filenames}\n"
+                f"Jalankan: python scripts/migrate_xgb_model.py"
+            )
+
+        # --- feature columns ---
+        feat_path = model_dir / config.feature_columns_filename
+        if not feat_path.exists():
+            raise FileNotFoundError(
+                f"{feat_path} tidak ada. Jalankan: "
+                f"python scripts/migrate_xgb_model.py"
+            )
+        feature_columns: List[str] = json.loads(feat_path.read_text(encoding="utf-8"))
+
+        # --- load XGBoost (json / ubj / pkl) ---
+        suffix = xgb_path.suffix.lower()
+        if suffix in {".json", ".ubj", ".model"}:
+            xgb_model = xgb.XGBClassifier()
+            xgb_model.load_model(str(xgb_path))
+        elif suffix in {".pkl", ".joblib"}:
+            obj = joblib.load(xgb_path)
+            if isinstance(obj, xgb.XGBClassifier):
+                xgb_model = obj
+            elif isinstance(obj, xgb.Booster):
+                xgb_model = xgb.XGBClassifier()
+                xgb_model._Booster = obj
+            else:
+                raise TypeError(f"{xgb_path} berisi {type(obj)}, bukan XGBClassifier")
+        else:
+            raise ValueError(f"Format tidak dikenal: {suffix}")
+
+        # validasi konsistensi
+        n_model = getattr(xgb_model, "n_features_in_", None)
+        if n_model is not None and n_model != len(feature_columns):
+            raise ValueError(
+                f"Mismatch: XGBoost dilatih dengan {n_model} fitur "
+                f"tapi feature_columns.json berisi {len(feature_columns)}"
+            )
+        LOGGER.info(
+            "XGBoost dimuat dari %s (%s) | n_features=%d | classes=%s",
+            xgb_path, suffix, len(feature_columns),
+            getattr(xgb_model, "classes_", "?"),
+        )
+
+        # --- Layer-2 (opsional) ---
         iso_path = model_dir / config.iso_filename
         scaler_path = model_dir / config.iso_scaler_filename
         meta_path = model_dir / config.iso_metadata_filename
-        feat_path = model_dir / config.feature_columns_filename
-        cat_path = model_dir / config.categorical_categories_filename
-
-        for path in (xgb_path, feat_path):
-            if not path.exists():
-                raise FileNotFoundError(f"Artefak wajib tidak ditemukan: {path}")
-
-        feature_columns: List[str] = json.loads(feat_path.read_text(encoding="utf-8"))
-
-        xgb_model = xgb.XGBClassifier()
-        xgb_model.load_model(str(xgb_path))
-        LOGGER.info("XGBoost dimuat dari %s (n_features=%d)", xgb_path, len(feature_columns))
 
         iso_model = None
         iso_scaler = None
@@ -142,10 +207,15 @@ class DualLayerDetector:
                 iso_scaler = joblib.load(scaler_path)
                 LOGGER.info("Isolation Forest dimuat dari %s", iso_path)
             else:
-                LOGGER.warning("Layer-2 diminta tapi artefak Isolation Forest tidak ada")
+                LOGGER.warning(
+                    "Layer-2 diminta tapi artefak tidak lengkap. "
+                    "Jalankan: python train_layer2.py --input data/raw/train.csv --label-column label"
+                )
             if meta_path.exists():
                 iso_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
 
+        # --- categorical categories ---
+        cat_path = model_dir / config.categorical_categories_filename
         categorical_categories: Dict[str, List[str]] = {}
         if cat_path.exists():
             categorical_categories = json.loads(cat_path.read_text(encoding="utf-8"))
@@ -163,6 +233,7 @@ class DualLayerDetector:
             iso_metadata=iso_metadata,
         )
 
+        # --- explainer (opsional) ---
         explainer = None
         if with_explainer and config.explain_on_attack:
             try:
@@ -182,14 +253,10 @@ class DualLayerDetector:
     # Preprocessing
     # ------------------------------------------------------------------ #
     def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Bangun lookup case-insensitive untuk seluruh key."""
         return {str(k).strip().lower(): v for k, v in record.items() if k is not None}
 
     def preprocess(self, record: Dict[str, Any]) -> pd.DataFrame:
-        """
-        Konversi satu record stream menjadi DataFrame 1 baris yang
-        align ke `feature_columns` XGBoost.
-        """
+        """Konversi satu record stream menjadi DataFrame 1 baris align ke feature_columns."""
         rec_low = self._normalize_record(record)
         row: Dict[str, Any] = {}
 
@@ -199,7 +266,7 @@ class DualLayerDetector:
             if key in rec_low:
                 row[col] = rec_low[key]
 
-        # 2) kategorikal -> OHE
+        # 2) kategorikal -> OHE manual
         for cat_col, categories in self._categorical.items():
             val = rec_low.get(cat_col.lower())
             val = "" if val is None else str(val).strip().lower()
@@ -227,6 +294,20 @@ class DualLayerDetector:
                 missing[:5], len(missing),
             )
 
+    def _zero_non_informative(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Zero-kan fitur identitas/port KHUSUS untuk Layer-2.
+
+        Konsisten dengan train_layer2.py yang zero-kan kolom ini SEBELUM
+        fit scaler. Isolation Forest tidak pernah melihat variasi port,
+        sehingga tidak false-positive pada port ephemeral.
+        """
+        cols = [c for c in X.columns if c.lower() in self.NON_INFORMATIVE]
+        if not cols:
+            return X
+        X = X.copy()
+        X[cols] = 0.0
+        return X
+
     # ------------------------------------------------------------------ #
     # Inference
     # ------------------------------------------------------------------ #
@@ -240,21 +321,26 @@ class DualLayerDetector:
         timestamp = float(stream_ts) if stream_ts is not None else time.time()
         X = self.preprocess(record)
 
-        # ---- Layer 1 ----
+        # ---- Layer-1: XGBoost ----
         try:
             proba_arr = self.artifacts.xgb_model.predict_proba(X)
-            prob_attack = float(proba_arr[0, 1]) if proba_arr.shape[1] > 1 else float(proba_arr[0, 0])
+            prob_attack = (
+                float(proba_arr[0, 1])
+                if proba_arr.shape[1] > 1
+                else float(proba_arr[0, 0])
+            )
         except Exception:  # noqa: BLE001
             LOGGER.exception("XGBoost predict_proba gagal")
             prob_attack = 0.0
         is_l1 = prob_attack >= self.config.xgb_threshold
 
-        # ---- Layer 2 ----
+        # ---- Layer-2: Isolation Forest (dengan zero non-informative) ----
         iso_score = 0.0
         is_l2 = False
         if self.artifacts.iso_model is not None and self.artifacts.iso_scaler is not None:
             try:
-                X_scaled = self.artifacts.iso_scaler.transform(X.values)
+                X_iso = self._zero_non_informative(X)       # ← PATCH PENTING
+                X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
                 iso_score = float(self.artifacts.iso_model.decision_function(X_scaled)[0])
                 is_l2 = iso_score < self._iso_threshold
             except Exception:  # noqa: BLE001
@@ -263,11 +349,11 @@ class DualLayerDetector:
         if not is_l1 and not is_l2:
             return None
 
-        # ---- Ekstraksi metadata IP ----
+        # ---- Metadata IP ----
         src_ip, dst_ip = self._extract_ips(record)
         stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
 
-        # ---- Bangun Alert ----
+        # ---- Alert L1 ----
         if is_l1:
             severity = self._severity_from_probability(prob_attack)
             tags: List[str] = []
@@ -299,7 +385,7 @@ class DualLayerDetector:
                     LOGGER.exception("Explainer L1 gagal")
             return alert
 
-        # Layer-2 only => zero-day
+        # ---- Alert L2 (zero-day) ----
         severity = self._severity_from_iso(iso_score, self._iso_threshold)
         alert = Alert(
             timestamp=timestamp,
@@ -359,8 +445,37 @@ class DualLayerDetector:
         return "LOW"
 
     def _severity_from_iso(self, score: float, threshold: float) -> str:
-        if threshold <= 0:
-            return "MEDIUM"
+        """Hitung severity dari Isolation Forest decision score.
+
+        Catatan penting:
+        sklearn.IsolationForest.decision_function() menghasilkan:
+            - skor POSITIF  = normal  (di atas threshold)
+            - skor NEGATIF  = anomali (di bawah threshold)
+        Threshold standar = 0.0 karena `offset_` internal sudah dikalibrasi
+        dengan `contamination` saat fit().
+
+        Skala empiris pada dataset RT-IoT (94 fitur, 10k normal):
+            Normal  : +0.02 .. +0.15
+            Mild    : -0.01 .. -0.05
+            Anomali : -0.05 .. -0.15
+            Severe  : -0.15 .. -0.30+
+        """
+        # Bukan anomali — tidak akan dipanggil sebenarnya, tapi jaga-jaga
+        if score >= threshold:
+            return "LOW"
+
+        # Kasus standar sklearn: threshold == 0.0 → pakai magnitude absolut
+        if abs(threshold) < 1e-9:
+            magnitude = abs(score)
+            if magnitude >= 0.15:
+                return "CRITICAL"
+            if magnitude >= 0.08:
+                return "HIGH"
+            if magnitude >= 0.03:
+                return "MEDIUM"
+            return "LOW"
+
+        # Kasus threshold negatif (mis. di-override) → pakai rasio relatif
         ratio = (threshold - score) / abs(threshold)
         if ratio >= 2.0:
             return "CRITICAL"

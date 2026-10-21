@@ -5,7 +5,7 @@ app.py
 GARUDA SENTINEL — Local Tactical Interface (Streamlit SOC).
 
 Jalankan:
-    streamlit run app.py
+    python -m streamlit run app.py
 """
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from engine.pipeline import GarudaPipeline, PipelineConfig
 from engine.detectors import DetectorConfig
+from engine.pipeline import GarudaPipeline, PipelineConfig
 from ui.components import (
     render_footer,
     render_header,
@@ -44,7 +44,6 @@ LOGGER = logging.getLogger("garuda.app")
 DEFAULT_MODEL_DIR = "models"
 DEFAULT_STREAM_CSV = "data/processed/simulation_stream.csv"
 DEFAULT_DELAY_MS = 200
-
 SEVERITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 
@@ -75,6 +74,7 @@ def _build_pipeline(model_dir: str, stream_csv: str, delay_ms: int) -> GarudaPip
             xgb_threshold=0.5,
             enable_layer2=True,
             explain_on_attack=True,
+            iso_threshold_override=0.037,
         ),
     )
     return GarudaPipeline.build(cfg)
@@ -101,16 +101,17 @@ def _init_state() -> None:
 # --------------------------------------------------------------------------- #
 def _render_sidebar(pipeline: GarudaPipeline) -> None:
     with st.sidebar:
+        # ---- Status ----
         st.markdown("### ⚙️ KONTROL SISTEM")
-
         if pipeline.is_running:
             if pipeline.is_paused:
-                st.warning("⏸ PAUSED")
+                st.warning("⏸ **PAUSED**")
             else:
-                st.success("🟢 OPERASIONAL")
+                st.success("🟢 **OPERASIONAL**")
         else:
-            st.error("🔴 TERHENTI")
+            st.error("🔴 **TERHENTI**")
 
+        # ---- Start/Stop ----
         c1, c2 = st.columns(2)
         with c1:
             if not pipeline.is_running:
@@ -124,7 +125,7 @@ def _render_sidebar(pipeline: GarudaPipeline) -> None:
         with c2:
             if pipeline.is_running:
                 if pipeline.is_paused:
-                    if st.button("▶ LANJUT", use_container_width=True):
+                    if st.button("▶ LANJUT", use_container_width=True, type="primary"):
                         pipeline.resume()
                         st.rerun()
                 else:
@@ -134,39 +135,40 @@ def _render_sidebar(pipeline: GarudaPipeline) -> None:
             else:
                 st.button("⏸ PAUSE", use_container_width=True, disabled=True)
 
-        st.divider()
-        st.markdown("### 👤 OPERATOR")
-        st.text_input("Operator ID", key="operator_id", max_chars=32)
+        # ---- Operator ----
+        with st.expander("👤 Operator", expanded=False):
+            st.text_input("Operator ID", key="operator_id", max_chars=32)
 
-        st.divider()
-        st.markdown("### 📊 REFRESH")
-        st.toggle("Auto-refresh", key="auto_refresh")
-        st.slider("Interval (detik)", 1, 10, key="refresh_interval_s")
-        if st.button("🔄 Refresh Sekarang", use_container_width=True):
-            st.rerun()
+        # ---- Refresh ----
+        with st.expander("📊 Refresh", expanded=False):
+            st.toggle("Auto-refresh", key="auto_refresh")
+            st.slider("Interval (detik)", 1, 10, key="refresh_interval_s")
+            if st.button("🔄 Refresh Sekarang", use_container_width=True):
+                st.rerun()
 
-        st.divider()
-        st.markdown("### 🔍 FILTER")
+        # ---- Filter ----
         st.selectbox(
-            "Severity minimum",
+            "🔍 Severity minimum",
             ["SEMUA", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
             key="severity_filter",
         )
 
+        # ---- Reset ----
         st.divider()
-        st.markdown("### 🧨 EMERGENCY")
-        if st.button("🔁 Reset Sistem", use_container_width=True):
-            try:
-                pipeline.stop()
-            finally:
-                st.cache_resource.clear()
-                st.session_state["auto_started"] = False
-                st.rerun()
+        with st.expander("🧨 EMERGENCY", expanded=False):
+            if st.button("🔁 Reset Sistem", use_container_width=True):
+                try:
+                    pipeline.stop()
+                finally:
+                    st.cache_resource.clear()
+                    st.session_state["auto_started"] = False
+                    st.rerun()
 
+        # ---- Brand ----
         st.divider()
-        st.caption("GARUDA SENTINEL v1.0")
+        st.caption("**GARUDA SENTINEL** v1.0")
         st.caption("Kartika Cyber Hackathon 2026")
-        st.caption("TNI AD · Air-Gapped Edge Native SOC")
+        st.caption("TNI AD · Air-Gapped Edge SOC")
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +211,9 @@ def main() -> None:
     _init_state()
 
     try:
-        pipeline = _build_pipeline(DEFAULT_MODEL_DIR, DEFAULT_STREAM_CSV, DEFAULT_DELAY_MS)
+        pipeline = _build_pipeline(
+            DEFAULT_MODEL_DIR, DEFAULT_STREAM_CSV, DEFAULT_DELAY_MS
+        )
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Gagal inisialisasi pipeline: {exc}")
         st.info(
@@ -227,36 +231,35 @@ def main() -> None:
 
     _render_sidebar(pipeline)
 
-    dashboard_slot = st.empty()
+    # ---- Dashboard ----
+    snapshot = pipeline.snapshot()
+    render_header(snapshot)
+    render_metrics(snapshot)
 
-    with dashboard_slot.container():
-        snapshot = pipeline.snapshot()
-        render_header(snapshot)
-        render_metrics(snapshot)
+    col_main, col_side = st.columns([2.5, 1], gap="medium")
 
-        col_left, col_right = st.columns([2.5, 1])
+    with col_main:
+        st.markdown("#### 🚨 THREAT CARDS")
+        active = _filter_by_severity(
+            pipeline.get_active_cards(),
+            st.session_state["severity_filter"],
+        )
+        if not active:
+            st.info("✅ Tidak ada ancaman aktif. Sistem dalam kondisi siaga penuh.")
+        else:
+            for card in active:
+                result = render_threat_card(card, key_prefix="live")
+                if result:
+                    _handle_action(pipeline, result, card)
 
-        with col_left:
-            st.markdown("#### 🚨 THREAT CARDS (Aggregated)")
-            active = _filter_by_severity(
-                pipeline.get_active_cards(),
-                st.session_state["severity_filter"],
-            )
-            if not active:
-                st.info("✅ Tidak ada ancaman aktif. Sistem dalam kondisi siaga penuh.")
-            else:
-                for card in active:
-                    result = render_threat_card(card, key_prefix="live")
-                    if result:
-                        _handle_action(pipeline, result, card)
+    with col_side:
+        render_system_panel(snapshot)
+        st.divider()
+        render_recent_actions(snapshot["recent_actions"])
 
-        with col_right:
-            render_system_panel(snapshot)
-            st.divider()
-            render_recent_actions(snapshot["recent_actions"])
+    render_footer()
 
-        render_footer()
-
+    # ---- Auto-refresh ----
     if st.session_state["auto_refresh"] and pipeline.is_running:
         time.sleep(st.session_state["refresh_interval_s"])
         st.rerun()

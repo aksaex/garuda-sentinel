@@ -1,0 +1,39 @@
+{
+  "model": "IsolationForest",
+  "trained_at_utc": "2026-10-21T02:07:51.767100+00:00",
+  "input_csv": "C:\\garuda-sentinel\\data\\raw\\train.csv",
+  "label_column": "label",
+  "normal_strategy": "label",
+  "benign_classes_used": [],
+  "normal_samples": 10006,
+  "n_features": 94,
+  "contamination": 0.05,
+  "n_estimators": 200,
+  "random_state": 42,
+  "score_threshold": -2.7755575615628914e-17,
+  "sklearn_version": "1.6.1",
+  "feature_columns_source": "models\\feature_columns.json",
+  "non_informative_zeroed": [
+    "id.orig_p",
+    "id.resp_p"
+  ],
+  "categorical_categories": {
+    "proto": [
+      "icmp",
+      "tcp",
+      "udp"
+    ],
+    "service": [
+      "-",
+      "dhcp",
+      "dns",
+      "http",
+      "irc",
+      "mqtt",
+      "ntp",
+      "radius",
+      "ssh",
+      "ssl"
+    ]
+  }
+}

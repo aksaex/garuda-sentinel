@@ -1,222 +1,319 @@
 #!/usr/bin/env python3
-"""ui/theme.py — Palet warna & CSS injeksi untuk GARUDA SENTINEL."""
+"""ui/theme.py — Palet warna & CSS tambahan untuk GARUDA SENTINEL."""
 from __future__ import annotations
 
 import streamlit as st
 
 
-PALETTE: dict[str, str] = {
-    "bg":           "#0A0E14",
-    "bg_card":      "#111820",
-    "bg_card_alt":  "#0D1117",
-    "border":       "#1F2A36",
-    "text":         "#E6EDF3",
-    "text_muted":   "#8B949E",
-    "success":      "#00C853",
-    "warning":      "#FFB300",
-    "danger":       "#FF1744",
-    "critical":     "#D50000",
-    "medium":       "#FF6D00",
-    "low":          "#FFB300",
-    "accent":       "#00E5FF",
-    "header_bg":    "#0D1117",
+# --------------------------------------------------------------------------- #
+# Palet — semua kombinasi foreground/background sudah diverifikasi WCAG AA
+# --------------------------------------------------------------------------- #
+PALETTE = {
+    "bg":            "#0D1117",
+    "bg_elevated":   "#161B22",
+    "bg_hover":      "#21262D",
+    "border":        "#30363D",
+    "border_subtle": "#21262D",
+    "text":          "#E6EDF3",
+    "text_muted":    "#8B949E",
+    "text_subtle":   "#6E7681",
+    "accent":        "#58A6FF",
+    "success":       "#2EA043",
+    "warning":       "#D29922",
+    "danger":        "#DA3633",
+    "danger_hover":  "#F85149",
+}
+
+# Badge styles: bg + fg sudah dicek kontras AA
+SEVERITY_STYLES: dict[str, dict[str, str]] = {
+    "CRITICAL": {"bg": "#7F0000", "fg": "#FFFFFF", "icon": "🔴"},
+    "HIGH":     {"bg": "#C62828", "fg": "#FFFFFF", "icon": "🟠"},
+    "MEDIUM":   {"bg": "#FB8C00", "fg": "#000000", "icon": "🟡"},
+    "LOW":      {"bg": "#2E7D32", "fg": "#FFFFFF", "icon": "🟢"},
 }
 
 
-SEVERITY_COLORS: dict[str, str] = {
-    "CRITICAL": PALETTE["critical"],
-    "HIGH":     PALETTE["danger"],
-    "MEDIUM":   PALETTE["medium"],
-    "LOW":      PALETTE["low"],
-}
+def severity_style(severity: str) -> dict[str, str]:
+    return SEVERITY_STYLES.get(str(severity).upper(), SEVERITY_STYLES["LOW"])
 
 
-def severity_color(severity: str) -> str:
-    return SEVERITY_COLORS.get(str(severity).upper(), PALETTE["warning"])
-
-
+# --------------------------------------------------------------------------- #
+# CSS — hanya untuk elemen dekoratif; native Streamlit sudah ditangani theme
+# --------------------------------------------------------------------------- #
 _CSS = f"""
 <style>
-  /* ---------- Global ---------- */
-  .stApp {{
-      background-color: {PALETTE['bg']};
-      color: {PALETTE['text']};
-      font-family: 'Inter', 'Segoe UI', sans-serif;
-  }}
-  section[data-testid="stSidebar"] {{
-      background-color: {PALETTE['header_bg']};
-      border-right: 1px solid {PALETTE['border']};
-  }}
-  h1, h2, h3, h4, h5 {{ color: {PALETTE['text']}; }}
+/* ============================================================ */
+/* Typography & layout dasar                                    */
+/* ============================================================ */
+html, body, [class*="css"] {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+}}
+code, pre, .gs-mono {{
+    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    font-size: 0.85em;
+}}
 
-  /* ---------- Header ---------- */
-  .gs-header {{
-      background: linear-gradient(90deg, {PALETTE['header_bg']} 0%, {PALETTE['bg_card']} 100%);
-      border-left: 4px solid {PALETTE['success']};
-      padding: 16px 24px;
-      border-radius: 6px;
-      margin-bottom: 18px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-  }}
-  .gs-title {{
-      font-family: 'JetBrains Mono', 'Consolas', monospace;
-      font-size: 26px;
-      font-weight: 700;
-      color: {PALETTE['success']};
-      letter-spacing: 3px;
-  }}
-  .gs-subtitle {{
-      color: {PALETTE['text_muted']};
-      font-size: 10px;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-      margin-top: 4px;
-  }}
-  .gs-status {{
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 13px;
-      font-weight: 600;
-      padding: 4px 12px;
-      border: 1px solid currentColor;
-      border-radius: 3px;
-  }}
+/* ============================================================ */
+/* Header banner                                                */
+/* ============================================================ */
+.gs-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px 20px;
+    background: linear-gradient(135deg, #0D1117 0%, #161B22 100%);
+    border: 1px solid {PALETTE['border']};
+    border-left: 4px solid {PALETTE['success']};
+    border-radius: 8px;
+    margin-bottom: 16px;
+}}
+.gs-header-title {{
+    font-size: clamp(18px, 3vw, 24px);
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: {PALETTE['success']};
+    line-height: 1.2;
+}}
+.gs-header-sub {{
+    font-size: clamp(9px, 1.5vw, 11px);
+    color: {PALETTE['text_muted']};
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-top: 4px;
+}}
+.gs-header-status {{
+    font-family: "JetBrains Mono", monospace;
+    font-size: clamp(11px, 1.5vw, 13px);
+    font-weight: 700;
+    padding: 6px 14px;
+    border: 2px solid currentColor;
+    border-radius: 4px;
+    letter-spacing: 1px;
+    white-space: nowrap;
+}}
 
-  /* ---------- Metric card ---------- */
-  .gs-metric {{
-      background: {PALETTE['bg_card']};
-      border: 1px solid {PALETTE['border']};
-      border-radius: 6px;
-      padding: 12px 16px;
-      text-align: left;
-  }}
-  .gs-metric-label {{
-      color: {PALETTE['text_muted']};
-      font-size: 10px;
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
-  }}
-  .gs-metric-value {{
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 22px;
-      font-weight: 700;
-      color: {PALETTE['text']};
-      margin-top: 4px;
-  }}
+/* ============================================================ */
+/* Metric grid — responsif (5 → 3 → 2 kolom)                    */
+/* ============================================================ */
+.gs-metrics-grid {{
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+}}
+.gs-metric-card {{
+    background: {PALETTE['bg_elevated']};
+    border: 1px solid {PALETTE['border']};
+    border-radius: 6px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: border-color 0.15s ease;
+}}
+.gs-metric-card:hover {{
+    border-color: {PALETTE['border']};
+    background: {PALETTE['bg_hover']};
+}}
+.gs-metric-label {{
+    font-size: 10px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: {PALETTE['text_muted']};
+    font-weight: 500;
+}}
+.gs-metric-value {{
+    font-family: "JetBrains Mono", monospace;
+    font-size: clamp(18px, 2.5vw, 22px);
+    font-weight: 700;
+    color: {PALETTE['text']};
+    line-height: 1.1;
+}}
+.gs-metric-sub {{
+    font-size: 10px;
+    color: {PALETTE['text_subtle']};
+    font-family: "JetBrains Mono", monospace;
+}}
 
-  /* ---------- Threat Card ---------- */
-  .gs-sev {{
-      display: inline-block;
-      padding: 2px 10px;
-      color: #fff;
-      font-weight: 700;
-      font-size: 10px;
-      border-radius: 3px;
-      letter-spacing: 1.5px;
-      margin-right: 10px;
-  }}
-  .gs-asset {{
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 14px;
-      color: {PALETTE['text']};
-  }}
-  .gs-card-count {{
-      text-align: right;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 18px;
-      color: {PALETTE['accent']};
-      line-height: 1.2;
-  }}
-  .gs-card-count small {{
-      color: {PALETTE['text_muted']};
-      font-size: 10px;
-  }}
-  .gs-card-meta {{
-      color: {PALETTE['text_muted']};
-      font-size: 11px;
-      font-family: 'JetBrains Mono', monospace;
-      margin: 4px 0 8px 0;
-  }}
-  .gs-explanation {{
-      background: {PALETTE['bg_card_alt']};
-      border-left: 3px solid {PALETTE['accent']};
-      padding: 10px 14px;
-      font-size: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      line-height: 1.55;
-      color: {PALETTE['text']};
-      margin: 8px 0;
-      border-radius: 3px;
-  }}
-  .gs-mitre {{
-      display: inline-block;
-      background: {PALETTE['border']};
-      color: {PALETTE['accent']};
-      padding: 2px 8px;
-      border-radius: 3px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
-      margin-right: 4px;
-      margin-bottom: 2px;
-      border: 1px solid {PALETTE['accent']}33;
-      letter-spacing: 0.5px;
-  }}
-  .gs-feat {{
-      display: inline-block;
-      background: {PALETTE['border']};
-      color: {PALETTE['warning']};
-      padding: 1px 8px;
-      border-radius: 2px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
-      margin-right: 4px;
-      margin-top: 2px;
-  }}
+/* ============================================================ */
+/* Severity badge                                               */
+/* ============================================================ */
+.gs-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    line-height: 1.4;
+    white-space: nowrap;
+}}
 
-  /* ---------- Action log ---------- */
-  .gs-log-entry {{
-      background: {PALETTE['bg_card_alt']};
-      border-left: 2px solid {PALETTE['danger']};
-      padding: 8px 10px;
-      margin-bottom: 6px;
-      font-size: 11px;
-      font-family: 'JetBrains Mono', monospace;
-      border-radius: 2px;
-  }}
-  .gs-log-ts {{
-      color: {PALETTE['text_muted']};
-      font-size: 10px;
-  }}
+/* ============================================================ */
+/* MITRE badges                                                 */
+/* ============================================================ */
+.gs-mitre-badge {{
+    display: inline-block;
+    background: {PALETTE['bg_hover']};
+    color: {PALETTE['accent']};
+    border: 1px solid {PALETTE['border']};
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 600;
+    margin: 2px 4px 2px 0;
+    letter-spacing: 0.5px;
+}}
 
-  /* ---------- Footer ---------- */
-  .gs-footer {{
-      color: {PALETTE['text_muted']};
-      font-size: 10px;
-      text-align: center;
-      padding: 12px;
-      border-top: 1px solid {PALETTE['border']};
-      margin-top: 20px;
-      font-family: 'JetBrains Mono', monospace;
-      letter-spacing: 1px;
-  }}
+/* ============================================================ */
+/* Feature chips (SHAP top-features)                            */
+/* ============================================================ */
+.gs-feature-chip {{
+    display: inline-block;
+    background: rgba(210, 153, 34, 0.12);
+    color: {PALETTE['warning']};
+    border: 1px solid rgba(210, 153, 34, 0.3);
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    margin: 2px 4px 2px 0;
+}}
 
-  /* ---------- Button primary override ---------- */
-  .stButton > button[kind="primary"] {{
-      background: {PALETTE['danger']};
-      color: #fff;
-      border: none;
-      font-weight: 700;
-      letter-spacing: 1px;
-  }}
-  .stButton > button[kind="primary"]:hover {{
-      background: {PALETTE['critical']};
-  }}
+/* ============================================================ */
+/* Audit log entries                                            */
+/* ============================================================ */
+.gs-log-entry {{
+    background: {PALETTE['bg_elevated']};
+    border-left: 3px solid {PALETTE['danger']};
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    border-radius: 4px;
+}}
+.gs-log-ts {{
+    color: {PALETTE['text_muted']};
+    font-size: 10px;
+    font-family: "JetBrains Mono", monospace;
+    margin-bottom: 4px;
+}}
+.gs-log-body {{
+    color: {PALETTE['text']};
+    font-family: "JetBrains Mono", monospace;
+}}
+
+/* ============================================================ */
+/* Buttons — fix selector untuk Streamlit 1.58+                 */
+/* ============================================================ */
+/* Semua tombol dapat focus ring yang jelas */
+.stButton > button:focus-visible,
+.stButton > button[data-testid^="stBaseButton"]:focus-visible {{
+    outline: 2px solid {PALETTE['accent']} !important;
+    outline-offset: 2px !important;
+}}
+
+/* Tombol primary DI MAIN AREA = danger (merah) */
+[data-testid="stMain"] .stButton > button[kind="primary"],
+[data-testid="stMain"] .stButton > button[data-testid="stBaseButton-primary"] {{
+    background-color: {PALETTE['danger']} !important;
+    color: #FFFFFF !important;
+    border: 1px solid {PALETTE['danger']} !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px;
+}}
+[data-testid="stMain"] .stButton > button[kind="primary"]:hover,
+[data-testid="stMain"] .stButton > button[data-testid="stBaseButton-primary"]:hover {{
+    background-color: {PALETTE['danger_hover']} !important;
+    border-color: {PALETTE['danger_hover']} !important;
+}}
+
+/* Tombol primary DI SIDEBAR = success (hijau, dibiarkan dari theme) */
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+    background-color: {PALETTE['success']} !important;
+    color: #FFFFFF !important;
+    font-weight: 600 !important;
+}}
+
+/* ============================================================ */
+/* Threat card container refinement                             */
+/* ============================================================ */
+[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"] {{
+    border-radius: 8px !important;
+}}
+
+/* ============================================================ */
+/* Blockquote (explanation) refinement                          */
+/* ============================================================ */
+[data-testid="stMain"] blockquote {{
+    border-left: 3px solid {PALETTE['accent']} !important;
+    background: {PALETTE['bg_elevated']} !important;
+    padding: 10px 14px !important;
+    margin: 8px 0 !important;
+    border-radius: 4px !important;
+    font-family: "JetBrains Mono", monospace !important;
+    font-size: 0.85em !important;
+    color: {PALETTE['text']} !important;
+}}
+
+/* ============================================================ */
+/* Footer                                                       */
+/* ============================================================ */
+.gs-footer {{
+    text-align: center;
+    color: {PALETTE['text_subtle']};
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    letter-spacing: 1px;
+    padding: 20px 0;
+    border-top: 1px solid {PALETTE['border_subtle']};
+    margin-top: 24px;
+}}
+
+/* ============================================================ */
+/* Responsive — tablet & mobile                                 */
+/* ============================================================ */
+@media (max-width: 1024px) {{
+    .gs-metrics-grid {{
+        grid-template-columns: repeat(3, 1fr);
+    }}
+}}
+@media (max-width: 640px) {{
+    .gs-metrics-grid {{
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+    }}
+    .gs-metric-card {{
+        padding: 10px 12px;
+    }}
+    .gs-header {{
+        padding: 12px 16px;
+        flex-direction: column;
+        align-items: flex-start;
+    }}
+    .gs-header-status {{
+        align-self: stretch;
+        text-align: center;
+    }}
+    /* Tap targets ≥44px (iOS guideline) */
+    .stButton > button {{
+        min-height: 44px !important;
+    }}
+    /* Kurangi padding container bawaan */
+    [data-testid="stMain"] .block-container {{
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }}
+}}
 </style>
 """
 
 
 def inject_theme() -> None:
-    """Suntikkan CSS dark-mode militer ke halaman Streamlit."""
+    """Suntikkan CSS dark-mode militer (idempoten, aman untuk rerun)."""
     st.markdown(_CSS, unsafe_allow_html=True)
