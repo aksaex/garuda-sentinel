@@ -23,4 +23,4 @@ jobs:
           context: .
           push: true
           # Ganti "username_kamu" dengan username Docker Hub aslimu
-          tags: username_kamu/garuda-sentinel:latest
+          tags: aksaex/garuda-sentinel:latest
