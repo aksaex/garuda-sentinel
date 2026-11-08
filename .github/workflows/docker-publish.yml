@@ -2,7 +2,7 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches: [ "main", "master" ] # Sesuaikan dengan nama branch utamamu
+    branches: [ "main", "master" ]
 
 jobs:
   build:
@@ -10,6 +10,25 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v3
+
+      # --- KODE PENDETEKSI ERROR MULAI ---
+      - name: Debug Secrets
+        run: |
+          echo "Mengecek ketersediaan secrets..."
+          if [ -z "${{ secrets.DOCKER_USERNAME }}" ]; then
+            echo "::error::DOCKER_USERNAME KOSONG! Rahasia ini tidak ditemukan atau tidak terbaca."
+            exit 1
+          else
+            echo "✅ DOCKER_USERNAME TERDETEKSI."
+          fi
+          
+          if [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
+            echo "::error::DOCKER_PASSWORD KOSONG! Rahasia ini tidak ditemukan atau tidak terbaca."
+            exit 1
+          else
+            echo "✅ DOCKER_PASSWORD TERDETEKSI."
+          fi
+      # --- KODE PENDETEKSI ERROR SELESAI ---
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
