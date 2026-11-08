@@ -1,0 +1,12 @@
+
+services:
+  garuda-dashboard:
+    build: .
+    container_name: garuda_sentinel_app
+    ports:
+      - "8501:8501"
+    volumes:
+      # Sinkronisasi folder logs agar riwayat intrusi tetap tersimpan di laptopmu
+      # meskipun container dimatikan
+      - ./logs:/app/logs
+    restart: unless-stopped
