@@ -41,4 +41,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: aksaex/garuda-sentinel:latest
+          tags: aksaecx/garuda-sentinel:latest
