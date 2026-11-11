@@ -1,14 +1,16 @@
-# Menggunakan Python 3.13 versi ringan sesuai dengan environment lokalmu
 FROM python:3.13-slim
 
-# Mencegah Python menulis file .pyc dan mem-buffer stdout/stderr (praktik terbaik Docker)
+# Mencegah Python menulis file .pyc dan mem-buffer stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+
+# Menambahkan /app ke PYTHONPATH agar modul 'engine' selalu terdeteksi
+ENV PYTHONPATH=/app
 
 # Menetapkan direktori kerja di dalam container
 WORKDIR /app
 
-# Menginstal dependensi sistem (libgomp1 sering dibutuhkan oleh XGBoost/CatBoost di Linux)
+# Menginstal dependensi sistem
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*

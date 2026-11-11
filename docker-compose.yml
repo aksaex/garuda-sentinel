@@ -1,4 +1,3 @@
-
 services:
   garuda-dashboard:
     build: .
@@ -6,7 +5,5 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      # Sinkronisasi folder logs agar riwayat intrusi tetap tersimpan di laptopmu
-      # meskipun container dimatikan
-      - ./logs:/app/logs
+      - .:/app
     restart: unless-stopped
