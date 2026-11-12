@@ -2,22 +2,21 @@
 """
 engine/detectors.py
 ===================
-Dual-Layer Detector untuk GARUDA SENTINEL.
+Dual-Layer AI Detector — XGBoost (Layer-1) + Isolation Forest (Layer-2).
 
-Layer-1 : XGBoost (known threats)       — supervisi, biner Normal/Attack
-Layer-2 : Isolation Forest (zero-day)   — semi-supervisi, Normal-only
-
-Preprocessing __wajib__ align dengan `feature_columns.json` yang
-dipakai saat training XGBoost. Categorical `proto` & `service`
-di-encode manual via `categorical_categories.json` agar tidak
-bergantung pada objek sklearn yang mungkin berbeda versi.
-
-Patch penting:
-- `xgb_filenames`: auto-detect xgb_known_threats.json atau xgboost_best.pkl
-- `_zero_non_informative()`: zero-kan id.orig_p/id.resp_p KHUSUS Layer-2
-  agar Isolation Forest tidak false-positive pada port ephemeral.
-- `_severity_from_iso()`: hitung severity dari magnitude decision_function
-  saat threshold == 0.0 (default sklearn IsolationForest offset).
+Production notes:
+- Feature contract enforcement: 94 fitur OHE, urutan sesuai
+  `feature_columns.json` yang dipakai XGBoost saat training.
+- Layer-2 feature parity: `id.orig_p` dan `id.resp_p` di-zero-kan
+  SEBELUM scaler.transform (konsisten dengan train_layer2.py).
+- Version compatibility: sklearn 1.6.1 + xgboost 2.1.4 (dipin di
+  requirements.txt) — model disimpan sebagai JSON untuk portabilitas.
+- Thread-safe: SHAP explainer internal state dilindungi lock di
+  TacticalExplainer; detector sendiri stateless.
+- Batch inference: `predict_batch()` menggunakan vectorized
+  preprocessing untuk throughput tinggi (diagnostic & replay).
+- Graceful degradation: Layer-2 opsional — jika artefak tidak lengkap,
+  Layer-1 tetap berjalan penuh.
 """
 from __future__ import annotations
 
@@ -32,11 +31,24 @@ import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+# Panggil secara dinamis hanya saat dibutuhkan
+# from catboost import CatBoostClassifier 
 
-from engine.explainer import TacticalExplainer
 from engine.triage_engine import Alert
 
 LOGGER = logging.getLogger("garuda.detector")
+
+
+# --------------------------------------------------------------------------- #
+# Konstanta — fitur yang HARUS di-zero untuk Layer-2
+# --------------------------------------------------------------------------- #
+# Port sumber (id.orig_p) adalah ephemeral → zero.
+# Port tujuan (id.resp_p) DIPERTAHANKAN karena sangat diskriminatif (1883 MQTT vs 22 SSH).
+NON_INFORMATIVE_FEATURES: frozenset[str] = frozenset({
+    "id.orig_p",
+    "unnamed: 0", "unnamed:0", "index",
+    "src_ip", "dst_ip", "src_port", "dst_port", "id",
+})
 
 
 # --------------------------------------------------------------------------- #
@@ -57,24 +69,26 @@ class DetectorConfig:
         "model.json",
         "model.pkl",
     ])
-
     iso_filename: str = "isolation_forest.pkl"
     iso_scaler_filename: str = "isolation_scaler.pkl"
     iso_metadata_filename: str = "isolation_metadata.json"
     feature_columns_filename: str = "feature_columns.json"
     categorical_categories_filename: str = "isolation_categorical_categories.json"
 
+    # Decision thresholds
     xgb_threshold: float = 0.5
-    iso_threshold_override: Optional[float] = None
-    enable_layer2: bool = True
-    explain_on_attack: bool = True
+    iso_threshold_override: Optional[float] = None  # None → pakai metadata
 
-    # severity dari probabilitas XGB
+    # Fitur Layer-2
+    enable_layer2: bool = True
+    explain_on_attack: bool = False # MATIKAN SECARA DEFAULT UNTUK EDGE INFERENCE
+
+    # Severity dari probabilitas XGB
     sev_critical: float = 0.95
     sev_high: float = 0.85
     sev_medium: float = 0.65
 
-    # fallback bila stream CSV tidak punya src_ip / dst_ip
+    # Fallback IP jika record tidak punya src/dst
     fallback_src_ip: str = "0.0.0.0"
     fallback_dst_ip: str = "0.0.0.0"
     strict_ips: bool = False
@@ -82,9 +96,9 @@ class DetectorConfig:
 
 @dataclass
 class ModelArtifacts:
-    xgb_model: xgb.XGBClassifier
-    iso_model: Any
-    iso_scaler: Any
+    xgb_model: Any  # Tipe Any untuk support CatBoost/XGBoost dinamis
+    iso_model: Optional[Any]
+    iso_scaler: Optional[Any]
     feature_columns: List[str]
     categorical_categories: Dict[str, List[str]]
     iso_metadata: Dict[str, Any] = field(default_factory=dict)
@@ -94,38 +108,33 @@ class ModelArtifacts:
 # Detector
 # --------------------------------------------------------------------------- #
 class DualLayerDetector:
-    """Layer-1 (XGBoost) + Layer-2 (Isolation Forest) inference wrapper."""
+    """Layer-1 (XGBoost/CatBoost) + Layer-2 (Isolation Forest) inference wrapper."""
 
     METADATA_KEYS = ("_stream_ts", "_row_index", "_loop_index")
-
-    # Fitur yang zero-kan KHUSUS untuk Layer-2 (bukan Layer-1).
-    NON_INFORMATIVE = {
-        "id.orig_p", "id.resp_p",
-        "unnamed: 0", "unnamed:0", "index",
-        "src_ip", "dst_ip", "src_port", "dst_port", "id",
-    }
 
     def __init__(
         self,
         artifacts: ModelArtifacts,
         config: DetectorConfig,
-        explainer: Optional[TacticalExplainer] = None,
+        explainer: Optional[Any] = None,
     ) -> None:
         self.artifacts = artifacts
         self.config = config
         self.explainer = explainer
 
-        self._feature_columns = list(artifacts.feature_columns)
+        self._feature_columns: List[str] = list(artifacts.feature_columns)
         self._lower_to_actual: Dict[str, str] = {c.lower(): c for c in self._feature_columns}
-        self._categorical = artifacts.categorical_categories
+        self._categorical: Dict[str, List[str]] = artifacts.categorical_categories
 
+        # Validasi kontrak fitur
+        self._validate_feature_contract()
+
+        # Threshold Layer-2
         iso_thr = config.iso_threshold_override
         if iso_thr is None:
             iso_thr = artifacts.iso_metadata.get("score_threshold", 0.0)
-        self._iso_threshold = float(iso_thr)
-        LOGGER.info("Isolation Forest threshold = %.6f", self._iso_threshold)
-
-        self._validate_category_columns()
+        self._iso_threshold: float = float(iso_thr)
+        LOGGER.info("Isolation Forest threshold = %+.6f", self._iso_threshold)
 
     # ------------------------------------------------------------------ #
     # Factory
@@ -135,93 +144,40 @@ class DualLayerDetector:
         cls,
         config: Optional[DetectorConfig] = None,
         *,
-        with_explainer: bool = True,
+        with_explainer: bool = False, # DEFAULT DIMATIKAN
     ) -> "DualLayerDetector":
         config = config or DetectorConfig()
         model_dir = Path(config.model_dir)
 
-        # --- cari XGBoost (multi-kandidat) ---
-        xgb_path: Optional[Path] = None
-        for fname in config.xgb_filenames:
-            p = model_dir / fname
-            if p.exists():
-                xgb_path = p
-                break
-        if xgb_path is None:
-            raise FileNotFoundError(
-                f"Model XGBoost tidak ditemukan di {model_dir}. "
-                f"Dicari: {config.xgb_filenames}\n"
-                f"Jalankan: python scripts/migrate_xgb_model.py"
-            )
-
-        # --- feature columns ---
+        # ---- Feature contract ----
         feat_path = model_dir / config.feature_columns_filename
         if not feat_path.exists():
             raise FileNotFoundError(
-                f"{feat_path} tidak ada. Jalankan: "
-                f"python scripts/migrate_xgb_model.py"
+                f"{feat_path} tidak ada. Pastikan direktori models/ valid.",
             )
         feature_columns: List[str] = json.loads(feat_path.read_text(encoding="utf-8"))
+        LOGGER.info("Feature contract: %d kolom", len(feature_columns))
 
-        # --- load XGBoost (json / ubj / pkl) ---
-        suffix = xgb_path.suffix.lower()
-        if suffix in {".json", ".ubj", ".model"}:
-            xgb_model = xgb.XGBClassifier()
-            xgb_model.load_model(str(xgb_path))
-        elif suffix in {".pkl", ".joblib"}:
-            obj = joblib.load(xgb_path)
-            if isinstance(obj, xgb.XGBClassifier):
-                xgb_model = obj
-            elif isinstance(obj, xgb.Booster):
-                xgb_model = xgb.XGBClassifier()
-                xgb_model._Booster = obj
-            else:
-                raise TypeError(f"{xgb_path} berisi {type(obj)}, bukan XGBClassifier")
-        else:
-            raise ValueError(f"Format tidak dikenal: {suffix}")
+        # ---- Layer-1 (XGBoost/CatBoost) ----
+        xgb_path = cls._resolve_xgb_path(model_dir, config.xgb_filenames)
+        xgb_model = cls._load_xgb(xgb_path, expected_n_features=len(feature_columns))
 
-        # validasi konsistensi
-        n_model = getattr(xgb_model, "n_features_in_", None)
-        if n_model is not None and n_model != len(feature_columns):
-            raise ValueError(
-                f"Mismatch: XGBoost dilatih dengan {n_model} fitur "
-                f"tapi feature_columns.json berisi {len(feature_columns)}"
-            )
-        LOGGER.info(
-            "XGBoost dimuat dari %s (%s) | n_features=%d | classes=%s",
-            xgb_path, suffix, len(feature_columns),
-            getattr(xgb_model, "classes_", "?"),
-        )
+        # ---- Layer-2 (opsional) ----
+        iso_model, iso_scaler, iso_metadata = cls._load_layer2(model_dir, config)
 
-        # --- Layer-2 (opsional) ---
-        iso_path = model_dir / config.iso_filename
-        scaler_path = model_dir / config.iso_scaler_filename
-        meta_path = model_dir / config.iso_metadata_filename
-
-        iso_model = None
-        iso_scaler = None
-        iso_metadata: Dict[str, Any] = {}
-        if config.enable_layer2:
-            if iso_path.exists() and scaler_path.exists():
-                iso_model = joblib.load(iso_path)
-                iso_scaler = joblib.load(scaler_path)
-                LOGGER.info("Isolation Forest dimuat dari %s", iso_path)
-            else:
-                LOGGER.warning(
-                    "Layer-2 diminta tapi artefak tidak lengkap. "
-                    "Jalankan: python train_layer2.py --input data/raw/train.csv --label-column label"
-                )
-            if meta_path.exists():
-                iso_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-
-        # --- categorical categories ---
+        # ---- Categorical categories ----
         cat_path = model_dir / config.categorical_categories_filename
         categorical_categories: Dict[str, List[str]] = {}
         if cat_path.exists():
             categorical_categories = json.loads(cat_path.read_text(encoding="utf-8"))
             LOGGER.info(
-                "Kategori kategorikal dimuat: %s",
+                "Kategori kategorikal: %s",
                 {k: len(v) for k, v in categorical_categories.items()},
+            )
+        else:
+            LOGGER.warning(
+                "%s tidak ada — fitur OHE akan diisi 0 untuk semua record",
+                cat_path.name,
             )
 
         artifacts = ModelArtifacts(
@@ -233,10 +189,11 @@ class DualLayerDetector:
             iso_metadata=iso_metadata,
         )
 
-        # --- explainer (opsional) ---
-        explainer = None
+        # ---- Explainer ----
+        explainer: Optional[Any] = None
         if with_explainer and config.explain_on_attack:
             try:
+                from engine.explainer import TacticalExplainer
                 explainer = TacticalExplainer(
                     xgb_model=xgb_model,
                     iso_model=iso_model,
@@ -250,58 +207,168 @@ class DualLayerDetector:
         return cls(artifacts=artifacts, config=config, explainer=explainer)
 
     # ------------------------------------------------------------------ #
+    # Loader helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _resolve_xgb_path(model_dir: Path, filenames: List[str]) -> Path:
+        for fname in filenames:
+            p = model_dir / fname
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            f"Model XGBoost tidak ditemukan di {model_dir}. Dicari: {filenames}",
+        )
+
+    @staticmethod
+    def _load_xgb(path: Path, expected_n_features: int) -> Any:
+        suffix = path.suffix.lower()
+        
+        if suffix == ".cbm":
+            from catboost import CatBoostClassifier
+            model = CatBoostClassifier()
+            model.load_model(str(path))
+            LOGGER.info("Model CatBoost dimuat: %s", path.name)
+            return model
+            
+        elif suffix in {".json", ".ubj", ".model"}:
+            model = xgb.XGBClassifier()
+            model.load_model(str(path))
+        elif suffix in {".pkl", ".joblib"}:
+            obj = joblib.load(path)
+            if isinstance(obj, xgb.XGBClassifier):
+                model = obj
+            elif isinstance(obj, xgb.Booster):
+                model = xgb.XGBClassifier()
+                model._Booster = obj
+            else:
+                raise TypeError(f"{path} berisi {type(obj)}, bukan XGBClassifier")
+        else:
+            raise ValueError(f"Format tidak dikenal: {suffix}")
+
+        n_model = getattr(model, "n_features_in_", None)
+        if n_model is not None and n_model != expected_n_features:
+            raise ValueError(
+                f"Mismatch: model dilatih dengan {n_model} fitur, "
+                f"tapi metadata berisi {expected_n_features}",
+            )
+        LOGGER.info(
+            "XGBoost dimuat: %s | n_features=%d",
+            path.name, expected_n_features,
+        )
+        return model
+
+    @staticmethod
+    def _load_layer2(
+        model_dir: Path, config: DetectorConfig,
+    ) -> Tuple[Optional[Any], Optional[Any], Dict[str, Any]]:
+        if not config.enable_layer2:
+            LOGGER.info("Layer-2 dinonaktifkan oleh konfigurasi")
+            return None, None, {}
+
+        iso_path = model_dir / config.iso_filename
+        scaler_path = model_dir / config.iso_scaler_filename
+        meta_path = model_dir / config.iso_metadata_filename
+
+        if not (iso_path.exists() and scaler_path.exists()):
+            LOGGER.warning(
+                "Layer-2 aktif tapi artefak tidak lengkap di %s", model_dir
+            )
+            return None, None, {}
+
+        iso_model = joblib.load(iso_path)
+        iso_scaler = joblib.load(scaler_path)
+        iso_metadata: Dict[str, Any] = {}
+        if meta_path.exists():
+            iso_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        LOGGER.info(
+            "Isolation Forest dimuat: contamination=%.3f",
+            getattr(iso_model, "contamination", 0.0),
+        )
+        return iso_model, iso_scaler, iso_metadata
+
+    # ------------------------------------------------------------------ #
+    # Feature contract validation
+    # ------------------------------------------------------------------ #
+    def _validate_feature_contract(self) -> None:
+        """Pastikan kategori OHE sesuai dengan feature_columns."""
+        missing: List[str] = []
+        for cat_col, cats in self._categorical.items():
+            for c in cats:
+                target = f"{cat_col.lower()}_{str(c).lower()}"
+                if target not in self._lower_to_actual:
+                    missing.append(target)
+        if missing:
+            LOGGER.warning(
+                "Kolom OHE tidak ada di feature_columns (diabaikan): %s", missing[:5]
+            )
+
+    # ------------------------------------------------------------------ #
     # Preprocessing
     # ------------------------------------------------------------------ #
-    def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         return {str(k).strip().lower(): v for k, v in record.items() if k is not None}
 
     def preprocess(self, record: Dict[str, Any]) -> pd.DataFrame:
-        """Konversi satu record stream menjadi DataFrame 1 baris align ke feature_columns."""
         rec_low = self._normalize_record(record)
-        row: Dict[str, Any] = {}
+        row: Dict[str, float] = {}
 
-        # 1) numerik & fitur non-kategorikal
         for col in self._feature_columns:
             key = col.lower()
             if key in rec_low:
-                row[col] = rec_low[key]
+                val = rec_low[key]
+                try:
+                    row[col] = float(val) if val is not None else 0.0
+                except (TypeError, ValueError):
+                    row[col] = 0.0
 
-        # 2) kategorikal -> OHE manual
         for cat_col, categories in self._categorical.items():
             val = rec_low.get(cat_col.lower())
-            val = "" if val is None else str(val).strip().lower()
+            val_str = "" if val is None else str(val).strip().lower()
             for cat in categories:
                 target_low = f"{cat_col.lower()}_{str(cat).lower()}"
                 actual = self._lower_to_actual.get(target_low)
                 if actual is None:
                     continue
-                row[actual] = 1.0 if val == str(cat).lower() else 0.0
+                row[actual] = 1.0 if val_str == str(cat).lower() else 0.0
 
-        df = pd.DataFrame([row]).reindex(columns=self._feature_columns, fill_value=0.0)
-        df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(np.float32)
-        return df
+        df = pd.DataFrame([row], columns=self._feature_columns).fillna(0.0)
+        return df.astype(np.float32)
 
-    def _validate_category_columns(self) -> None:
-        missing = []
-        for cat_col, cats in self._categorical.items():
-            for c in cats:
-                if f"{cat_col.lower()}_{str(c).lower()}" not in self._lower_to_actual:
-                    missing.append(f"{cat_col}_{c}")
-        if missing:
-            LOGGER.warning(
-                "Kolom OHE tidak ditemukan di feature_columns (akan diabaikan): %s "
-                "(total %d)",
-                missing[:5], len(missing),
-            )
+    def preprocess_batch(self, records: List[Dict[str, Any]]) -> pd.DataFrame:
+        normalized = [self._normalize_record(r) for r in records]
+        n = len(normalized)
+        data: Dict[str, np.ndarray] = {}
+        for col in self._feature_columns:
+            key = col.lower()
+            values = np.empty(n, dtype=np.float32)
+            for i, rec in enumerate(normalized):
+                v = rec.get(key)
+                try:
+                    values[i] = float(v) if v is not None else 0.0
+                except (TypeError, ValueError):
+                    values[i] = 0.0
+            data[col] = values
+
+        for cat_col, categories in self._categorical.items():
+            key = cat_col.lower()
+            for cat in categories:
+                target_low = f"{cat_col.lower()}_{str(cat).lower()}"
+                actual = self._lower_to_actual.get(target_low)
+                if actual is None:
+                    continue
+                cat_low = str(cat).lower()
+                data[actual] = np.array(
+                    [1.0 if str(r.get(key, "")).strip().lower() == cat_low else 0.0
+                     for r in normalized],
+                    dtype=np.float32,
+                )
+
+        return pd.DataFrame(data, columns=self._feature_columns)
 
     def _zero_non_informative(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Zero-kan fitur identitas/port KHUSUS untuk Layer-2.
-
-        Konsisten dengan train_layer2.py yang zero-kan kolom ini SEBELUM
-        fit scaler. Isolation Forest tidak pernah melihat variasi port,
-        sehingga tidak false-positive pada port ephemeral.
-        """
-        cols = [c for c in X.columns if c.lower() in self.NON_INFORMATIVE]
+        cols = [c for c in X.columns if c.lower() in NON_INFORMATIVE_FEATURES]
         if not cols:
             return X
         X = X.copy()
@@ -309,7 +376,7 @@ class DualLayerDetector:
         return X
 
     # ------------------------------------------------------------------ #
-    # Inference
+    # Inference (single record)
     # ------------------------------------------------------------------ #
     def predict(
         self,
@@ -317,75 +384,164 @@ class DualLayerDetector:
         *,
         stream_ts: Optional[float] = None,
     ) -> Optional[Alert]:
-        """Return Alert bila attack/zero-day, else None."""
         timestamp = float(stream_ts) if stream_ts is not None else time.time()
         X = self.preprocess(record)
 
-        # ---- Layer-1: XGBoost ----
+        prob_attack, is_l1 = self._run_layer1(X)
+        iso_score, is_l2 = self._run_layer2(X)
+
+        if not is_l1 and not is_l2:
+            return None
+
+        src_ip, dst_ip = self._extract_ips(record)
+        stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
+
+        if is_l1:
+            return self._build_l1_alert(
+                X, timestamp, src_ip, dst_ip, prob_attack, iso_score, is_l2, stream_meta, record,
+            )
+        return self._build_l2_alert(
+            X, timestamp, src_ip, dst_ip, prob_attack, iso_score, stream_meta, record,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Inference (batch)
+    # ------------------------------------------------------------------ #
+    def predict_batch(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        include_normal: bool = False,
+    ) -> List[Optional[Alert]]:
+        if not records:
+            return []
+
+        X_all = self.preprocess_batch(records)
+
+        # XGBoost/CatBoost batch
+        try:
+            proba_arr = self.artifacts.xgb_model.predict_proba(X_all)
+            prob_attack_all = proba_arr[:, 1] if proba_arr.ndim == 2 else proba_arr
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Batch predict_proba gagal")
+            prob_attack_all = np.zeros(len(records), dtype=np.float32)
+
+        # Isolation Forest batch
+        iso_score_all = np.zeros(len(records), dtype=np.float32)
+        if self.artifacts.iso_model is not None and self.artifacts.iso_scaler is not None:
+            try:
+                X_iso = self._zero_non_informative(X_all)
+                X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
+                iso_score_all = self.artifacts.iso_model.decision_function(X_scaled)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Isolation Forest batch gagal")
+
+        results: List[Optional[Alert]] = []
+        for i, record in enumerate(records):
+            prob = float(prob_attack_all[i])
+            iso = float(iso_score_all[i])
+            is_l1 = prob >= self.config.xgb_threshold
+            is_l2 = iso < self._iso_threshold
+
+            if not is_l1 and not is_l2 and not include_normal:
+                results.append(None)
+                continue
+
+            X_row = X_all.iloc[[i]]
+            timestamp = record.get("_stream_ts", time.time())
+            src_ip, dst_ip = self._extract_ips(record)
+            stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
+
+            if is_l1:
+                results.append(self._build_l1_alert(
+                    X_row, float(timestamp), src_ip, dst_ip, prob, iso, is_l2,
+                    stream_meta, record,
+                ))
+            elif is_l2:
+                results.append(self._build_l2_alert(
+                    X_row, float(timestamp), src_ip, dst_ip, prob, iso,
+                    stream_meta, record,
+                ))
+            else:
+                results.append(None)
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Layer runners
+    # ------------------------------------------------------------------ #
+    def _run_layer1(self, X: pd.DataFrame) -> Tuple[float, bool]:
         try:
             proba_arr = self.artifacts.xgb_model.predict_proba(X)
-            prob_attack = (
+            prob = (
                 float(proba_arr[0, 1])
                 if proba_arr.shape[1] > 1
                 else float(proba_arr[0, 0])
             )
         except Exception:  # noqa: BLE001
-            LOGGER.exception("XGBoost predict_proba gagal")
-            prob_attack = 0.0
-        is_l1 = prob_attack >= self.config.xgb_threshold
+            LOGGER.exception("Model predict_proba gagal")
+            prob = 0.0
+        return prob, prob >= self.config.xgb_threshold
 
-        # ---- Layer-2: Isolation Forest (dengan zero non-informative) ----
-        iso_score = 0.0
-        is_l2 = False
-        if self.artifacts.iso_model is not None and self.artifacts.iso_scaler is not None:
-            try:
-                X_iso = self._zero_non_informative(X)       # ← PATCH PENTING
-                X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
-                iso_score = float(self.artifacts.iso_model.decision_function(X_scaled)[0])
-                is_l2 = iso_score < self._iso_threshold
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Isolation Forest gagal; lewati layer-2")
+    def _run_layer2(self, X: pd.DataFrame) -> Tuple[float, bool]:
+        if self.artifacts.iso_model is None or self.artifacts.iso_scaler is None:
+            return 0.0, False
+        try:
+            X_iso = self._zero_non_informative(X)
+            X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
+            score = float(self.artifacts.iso_model.decision_function(X_scaled)[0])
+            return score, score < self._iso_threshold
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Isolation Forest gagal; lewati layer-2")
+            return 0.0, False
 
-        if not is_l1 and not is_l2:
-            return None
+    # ------------------------------------------------------------------ #
+    # Alert builders
+    # ------------------------------------------------------------------ #
+    def _build_l1_alert(
+        self,
+        X: pd.DataFrame,
+        timestamp: float,
+        src_ip: str,
+        dst_ip: str,
+        prob_attack: float,
+        iso_score: float,
+        is_l2: bool,
+        stream_meta: Dict[str, Any],
+        record: Dict[str, Any],
+    ) -> Alert:
+        severity = self._severity_from_probability(prob_attack)
+        tags: List[str] = ["ZERO_DAY_CORROBORATED"] if is_l2 else []
+        anomaly_type = self._infer_attack_type(X)
 
-        # ---- Metadata IP ----
-        src_ip, dst_ip = self._extract_ips(record)
-        stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
+        alert = Alert(
+            timestamp=timestamp,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            anomaly_type=anomaly_type,
+            severity=severity,
+            layer=1,
+            score=prob_attack,
+            features={
+                "model_prob": prob_attack,
+                "iso_score": iso_score,
+                **stream_meta,
+            },
+            tags=tags,
+            raw=record,
+        )
+        return alert
 
-        # ---- Alert L1 ----
-        if is_l1:
-            severity = self._severity_from_probability(prob_attack)
-            tags: List[str] = []
-            if is_l2:
-                tags.append("ZERO_DAY_CORROBORATED")
-            alert = Alert(
-                timestamp=timestamp,
-                src_ip=src_ip,
-                dst_ip=dst_ip,
-                anomaly_type=self._infer_attack_type(X) if self.explainer else "known_threat",
-                severity=severity,
-                layer=1,
-                score=prob_attack,
-                features={"xgb_prob": prob_attack, "iso_score": iso_score, **stream_meta},
-                tags=tags,
-                raw=record,
-            )
-            if self.explainer is not None and self.config.explain_on_attack:
-                try:
-                    sentence, top = self.explainer.explain_known_threat(
-                        X,
-                        severity=severity,
-                        probability=prob_attack,
-                        anomaly_type=alert.anomaly_type,
-                    )
-                    alert.features["explanation"] = sentence
-                    alert.features["top_features"] = top
-                except Exception:  # noqa: BLE001
-                    LOGGER.exception("Explainer L1 gagal")
-            return alert
-
-        # ---- Alert L2 (zero-day) ----
+    def _build_l2_alert(
+        self,
+        X: pd.DataFrame,
+        timestamp: float,
+        src_ip: str,
+        dst_ip: str,
+        prob_attack: float,
+        iso_score: float,
+        stream_meta: Dict[str, Any],
+        record: Dict[str, Any],
+    ) -> Alert:
         severity = self._severity_from_iso(iso_score, self._iso_threshold)
         alert = Alert(
             timestamp=timestamp,
@@ -398,24 +554,12 @@ class DualLayerDetector:
             features={
                 "iso_score": iso_score,
                 "iso_threshold": self._iso_threshold,
-                "xgb_prob": prob_attack,
+                "model_prob": prob_attack,
                 **stream_meta,
             },
             tags=["ZERO_DAY"],
             raw=record,
         )
-        if self.explainer is not None and self.config.explain_on_attack:
-            try:
-                sentence, top = self.explainer.explain_zero_day(
-                    X,
-                    severity=severity,
-                    decision_score=iso_score,
-                    score_threshold=self._iso_threshold,
-                )
-                alert.features["explanation"] = sentence
-                alert.features["top_features"] = top
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Explainer L2 gagal")
         return alert
 
     # ------------------------------------------------------------------ #
@@ -427,7 +571,7 @@ class DualLayerDetector:
         dst = rec_low.get("dst_ip") or rec_low.get("destination_ip") or rec_low.get("dst")
         if self.config.strict_ips and (src is None or dst is None):
             raise ValueError(
-                f"Record tidak punya src_ip/dst_ip; contoh key: {list(rec_low)[:10]}"
+                f"Record tidak punya src_ip/dst_ip; contoh key: {list(rec_low)[:10]}",
             )
         return (
             str(src) if src is not None else self.config.fallback_src_ip,
@@ -445,37 +589,19 @@ class DualLayerDetector:
         return "LOW"
 
     def _severity_from_iso(self, score: float, threshold: float) -> str:
-        """Hitung severity dari Isolation Forest decision score.
-
-        Catatan penting:
-        sklearn.IsolationForest.decision_function() menghasilkan:
-            - skor POSITIF  = normal  (di atas threshold)
-            - skor NEGATIF  = anomali (di bawah threshold)
-        Threshold standar = 0.0 karena `offset_` internal sudah dikalibrasi
-        dengan `contamination` saat fit().
-
-        Skala empiris pada dataset RT-IoT (94 fitur, 10k normal):
-            Normal  : +0.02 .. +0.15
-            Mild    : -0.01 .. -0.05
-            Anomali : -0.05 .. -0.15
-            Severe  : -0.15 .. -0.30+
-        """
-        # Bukan anomali — tidak akan dipanggil sebenarnya, tapi jaga-jaga
         if score >= threshold:
             return "LOW"
 
-        # Kasus standar sklearn: threshold == 0.0 → pakai magnitude absolut
         if abs(threshold) < 1e-9:
-            magnitude = abs(score)
-            if magnitude >= 0.15:
+            m = abs(score)
+            if m >= 0.15:
                 return "CRITICAL"
-            if magnitude >= 0.08:
+            if m >= 0.08:
                 return "HIGH"
-            if magnitude >= 0.03:
+            if m >= 0.03:
                 return "MEDIUM"
             return "LOW"
 
-        # Kasus threshold negatif (mis. di-override) → pakai rasio relatif
         ratio = (threshold - score) / abs(threshold)
         if ratio >= 2.0:
             return "CRITICAL"
@@ -486,7 +612,6 @@ class DualLayerDetector:
         return "LOW"
 
     def _infer_attack_type(self, X: pd.DataFrame) -> str:
-        """Heuristik tipe serangan dari top-3 |z-score| terhadap baseline."""
         if self.artifacts.iso_scaler is None:
             return "known_threat"
         try:

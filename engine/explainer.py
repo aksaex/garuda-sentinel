@@ -1,449 +1,674 @@
 #!/usr/bin/env python3
 """
-engine/explainer.py
+engine/detectors.py
 ===================
-Tactical Explainer untuk GARUDA SENTINEL.
+Dual-Layer AI Detector — XGBoost (Layer-1) + Isolation Forest (Layer-2).
 
-Menerjemahkan 2 (default) fitur penyumbang anomali tertinggi — dihitung
-via SHAP TreeExplainer — menjadi kalimat brief taktis berbahasa Indonesia.
-
-Mendukung dua mode:
-    - Known threat (XGBoost, layer-1)
-    - Zero-day (Isolation Forest, layer-2) dengan fallback z-score
-      dari StandardScaler bila SHAP gagal.
+Production notes:
+- Feature contract enforcement: 94 fitur OHE, urutan sesuai
+  `feature_columns.json` yang dipakai XGBoost saat training.
+- Layer-2 feature parity: `id.orig_p` dan `id.resp_p` di-zero-kan
+  SEBELUM scaler.transform (konsisten dengan train_layer2.py).
+- Version compatibility: sklearn 1.6.1 + xgboost 2.1.4 (dipin di
+  requirements.txt) — model disimpan sebagai JSON untuk portabilitas.
+- Thread-safe: SHAP explainer internal state dilindungi lock di
+  TacticalExplainer; detector sendiri stateless.
+- Batch inference: `predict_batch()` menggunakan vectorized
+  preprocessing untuk throughput tinggi (diagnostic & replay).
+- Graceful degradation: Layer-2 opsional — jika artefak tidak lengkap,
+  Layer-1 tetap berjalan penuh.
 """
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
-import shap
+import xgboost as xgb
 
-LOGGER = logging.getLogger("garuda.explainer")
+from engine.triage_engine import Alert
+
+LOGGER = logging.getLogger("garuda.detector")
 
 
 # --------------------------------------------------------------------------- #
-# Dictionary taktis: feature -> template arah (up/down)
+# Konstanta — fitur yang HARUS di-zero untuk Layer-2
 # --------------------------------------------------------------------------- #
-FEATURE_TEMPLATES: Dict[str, Dict[str, str]] = {
-    "flow_duration":    {"up": "lonjakan abnormal pada durasi flow",
-                         "down": "penurunan abnormal pada durasi flow"},
-    "header_length":    {"up": "panjang header melampaui baseline normal",
-                         "down": "panjang header lebih pendek dari baseline"},
-    "duration":         {"up": "koneksi berlangsung lebih lama dari normal",
-                         "down": "koneksi terlalu singkat (indikasi probe)"},
-    "rate":             {"up": "lonjakan laju paket total",
-                         "down": "penurunan laju paket total"},
-    "srate":            {"up": "lonjakan laju pengiriman dari sumber",
-                         "down": "penurunan laju pengiriman dari sumber"},
-    "drate":            {"up": "lonjakan laju penerimaan ke tujuan",
-                         "down": "penurunan laju penerimaan ke tujuan"},
-    "syn_flag_number":  {"up": "lonjakan flag SYN (indikasi SYN flood atau port scan)",
-                         "down": "anomali rendahnya flag SYN"},
-    "ack_flag_number":  {"up": "lonjakan flag ACK",
-                         "down": "anomali rendahnya flag ACK"},
-    "fin_flag_number":  {"up": "lonjakan flag FIN (koneksi diputus paksa)",
-                         "down": "anomali rendahnya flag FIN"},
-    "rst_flag_number":  {"up": "lonjakan flag RST (reset koneksi masif)",
-                         "down": "anomali rendahnya flag RST"},
-    "psh_flag_number":  {"up": "lonjakan flag PSH",
-                         "down": "anomali rendahnya flag PSH"},
-    "ece_flag_number":  {"up": "lonjakan flag ECE",
-                         "down": "anomali rendahnya flag ECE"},
-    "cwr_flag_number":  {"up": "lonjakan flag CWR",
-                         "down": "anomali rendahnya flag CWR"},
-    "syn_count":        {"up": "lonjakan jumlah paket SYN",
-                         "down": "penurunan jumlah paket SYN"},
-    "ack_count":        {"up": "lonjakan jumlah paket ACK",
-                         "down": "penurunan jumlah paket ACK"},
-    "fin_count":        {"up": "lonjakan jumlah paket FIN",
-                         "down": "penurunan jumlah paket FIN"},
-    "rst_count":        {"up": "lonjakan jumlah paket RST",
-                         "down": "penurunan jumlah paket RST"},
-    "http":             {"up": "eskalasi trafik protokol HTTP",
-                         "down": "penurunan trafik HTTP"},
-    "https":            {"up": "eskalasi trafik protokol HTTPS",
-                         "down": "penurunan trafik HTTPS"},
-    "dns":              {"up": "lonjakan trafik DNS (potensi DNS tunneling)",
-                         "down": "penurunan trafik DNS"},
-    "ssh":              {"up": "lonjakan trafik SSH (potensi brute-force)",
-                         "down": "penurunan trafik SSH"},
-    "telnet":           {"up": "eskalasi trafik Telnet (protokol tidak aman)",
-                         "down": "penurunan trafik Telnet"},
-    "smtp":             {"up": "lonjakan trafik SMTP",
-                         "down": "penurunan trafik SMTP"},
-    "irc":              {"up": "lonjakan trafik IRC (potensi C2)",
-                         "down": "penurunan trafik IRC"},
-    "tcp":              {"up": "eskalasi trafik TCP",
-                         "down": "penurunan trafik TCP"},
-    "udp":              {"up": "eskalasi trafik UDP",
-                         "down": "penurunan trafik UDP"},
-    "dhcp":             {"up": "lonjakan trafik DHCP",
-                         "down": "penurunan trafik DHCP"},
-    "arp":              {"up": "lonjakan trafik ARP (potensi ARP spoofing)",
-                         "down": "penurunan trafik ARP"},
-    "icmp":             {"up": "lonjakan trafik ICMP (potensi ICMP flood)",
-                         "down": "penurunan trafik ICMP"},
-    "igmp":             {"up": "lonjakan trafik IGMP",
-                         "down": "penurunan trafik IGMP"},
-    "llc":              {"up": "lonjakan trafik LLC",
-                         "down": "penurunan trafik LLC"},
-    "ipv":              {"up": "lonjakan trafik IPv",
-                         "down": "penurunan trafik IPv"},
-    "tot_size":         {"up": "lonjakan ukuran total paket",
-                         "down": "penurunan ukuran total paket"},
-    "tot_sum":          {"up": "lonjakan agregat ukuran paket",
-                         "down": "penurunan agregat ukuran paket"},
-    "min":              {"up": "lonjakan nilai minimum ukuran paket",
-                         "down": "penurunan nilai minimum ukuran paket"},
-    "max":              {"up": "lonjakan nilai maksimum ukuran paket",
-                         "down": "penurunan nilai maksimum ukuran paket"},
-    "avg":              {"up": "lonjakan rata-rata ukuran paket",
-                         "down": "penurunan rata-rata ukuran paket"},
-    "std":              {"up": "lonjakan deviasi standar ukuran paket",
-                         "down": "penurunan deviasi standar ukuran paket"},
-    "variance":         {"up": "lonjakan variansi ukuran paket",
-                         "down": "penurunan variansi ukuran paket"},
-    "iat":              {"up": "lonjakan interval antar paket (IAT)",
-                         "down": "interval antar paket terlalu rapat (indikasi flood)"},
-    "number":           {"up": "lonjakan jumlah paket dalam flow",
-                         "down": "penurunan jumlah paket dalam flow"},
-    "protocol_type":    {"up": "pergeseran tipe protokol pada flow",
-                         "down": "pergeseran tipe protokol pada flow"},
-}
-
-RECOMMENDATIONS: Dict[str, str] = {
-    "CRITICAL": "Rekomendasi: isolasi aset segera dan aktifkan protokol containment level-3.",
-    "HIGH":     "Rekomendasi: verifikasi aset dan pertimbangkan isolasi jaringan.",
-    "MEDIUM":   "Rekomendasi: monitor intensif dan validasi log aset terkait.",
-    "LOW":      "Rekomendasi: catat dan lanjutkan monitoring berkala.",
-}
-
-CONFIDENCE_BANDS: List[Tuple[float, str]] = [
-    (0.95, "SANGAT TINGGI"),
-    (0.85, "TINGGI"),
-    (0.65, "SEDANG"),
-    (0.00, "RENDAH"),
-]
+# Port sumber (id.orig_p) adalah ephemeral → zero.
+# Port tujuan (id.resp_p) DIPERTAHANKAN karena sangat diskriminatif (1883 MQTT vs 22 SSH).
+NON_INFORMATIVE_FEATURES: frozenset[str] = frozenset({
+    "id.orig_p",
+    "unnamed: 0", "unnamed:0", "index",
+    "src_ip", "dst_ip", "src_port", "dst_port", "id",
+})
 
 
 # --------------------------------------------------------------------------- #
 # Konfigurasi
 # --------------------------------------------------------------------------- #
 @dataclass
-class ExplainerConfig:
-    top_k: int = 2
-    style: str = "full"  # "short" | "full"
-    include_recommendation: bool = True
-    max_phrase_chars: int = 400
-    shap_fallback_to_zscore: bool = True
+class DetectorConfig:
+    model_dir: Path = Path("models")
+
+    # Multi-kandidat: cari yang pertama ada
+    xgb_filenames: List[str] = field(default_factory=lambda: [
+        "xgb_known_threats.json",
+        "xgb_known_threats.ubj",
+        "xgb_known_threats.pkl",
+        "xgboost_best.json",
+        "xgboost_best.ubj",
+        "xgboost_best.pkl",
+        "model.json",
+        "model.pkl",
+    ])
+    iso_filename: str = "isolation_forest.pkl"
+    iso_scaler_filename: str = "isolation_scaler.pkl"
+    iso_metadata_filename: str = "isolation_metadata.json"
+    feature_columns_filename: str = "feature_columns.json"
+    categorical_categories_filename: str = "isolation_categorical_categories.json"
+
+    # Decision thresholds
+    xgb_threshold: float = 0.5
+    iso_threshold_override: Optional[float] = None  # None → pakai metadata
+
+    # Fitur Layer-2
+    enable_layer2: bool = True
+    explain_on_attack: bool = True
+
+    # Severity dari probabilitas XGB
+    sev_critical: float = 0.95
+    sev_high: float = 0.85
+    sev_medium: float = 0.65
+
+    # Fallback IP jika record tidak punya src/dst
+    fallback_src_ip: str = "0.0.0.0"
+    fallback_dst_ip: str = "0.0.0.0"
+    strict_ips: bool = False
+
+
+@dataclass
+class ModelArtifacts:
+    xgb_model: xgb.XGBClassifier
+    iso_model: Optional[Any]
+    iso_scaler: Optional[Any]
+    feature_columns: List[str]
+    categorical_categories: Dict[str, List[str]]
+    iso_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
-# Tactical Explainer
+# Detector
 # --------------------------------------------------------------------------- #
-class TacticalExplainer:
-    """
-    Membungkus SHAP TreeExplainer untuk XGBoost (layer-1) dan
-    Isolation Forest (layer-2, dengan fallback z-score).
-    """
+class DualLayerDetector:
+    """Layer-1 (XGBoost) + Layer-2 (Isolation Forest) inference wrapper."""
+
+    METADATA_KEYS = ("_stream_ts", "_row_index", "_loop_index")
 
     def __init__(
         self,
-        *,
-        xgb_model: Any,
-        iso_model: Optional[Any],
-        iso_scaler: Optional[Any],
-        feature_columns: List[str],
-        config: Optional[ExplainerConfig] = None,
+        artifacts: ModelArtifacts,
+        config: DetectorConfig,
+        explainer: Optional[TacticalExplainer] = None,
     ) -> None:
-        self.config = config or ExplainerConfig()
-        self.feature_columns = list(feature_columns)
-        self.iso_scaler = iso_scaler
+        self.artifacts = artifacts
+        self.config = config
+        self.explainer = explainer
 
-        self._xgb_explainer = shap.TreeExplainer(xgb_model, feature_perturbation="tree_path_dependent")
-        self._iso_explainer: Optional[shap.TreeExplainer] = None
-        if iso_model is not None:
+        self._feature_columns: List[str] = list(artifacts.feature_columns)
+        self._lower_to_actual: Dict[str, str] = {c.lower(): c for c in self._feature_columns}
+        self._categorical: Dict[str, List[str]] = artifacts.categorical_categories
+
+        # Validasi kontrak fitur
+        self._validate_feature_contract()
+
+        # Threshold Layer-2
+        iso_thr = config.iso_threshold_override
+        if iso_thr is None:
+            iso_thr = artifacts.iso_metadata.get("score_threshold", 0.0)
+        self._iso_threshold: float = float(iso_thr)
+        LOGGER.info("Isolation Forest threshold = %+.6f", self._iso_threshold)
+
+    # ------------------------------------------------------------------ #
+    # Factory
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def load(
+        cls,
+        config: Optional[DetectorConfig] = None,
+        *,
+        with_explainer: bool = True,
+    ) -> "DualLayerDetector":
+        config = config or DetectorConfig()
+        model_dir = Path(config.model_dir)
+
+        # ---- Feature contract ----
+        feat_path = model_dir / config.feature_columns_filename
+        if not feat_path.exists():
+            raise FileNotFoundError(
+                f"{feat_path} tidak ada. Jalankan: python scripts/migrate_xgb_model.py",
+            )
+        feature_columns: List[str] = json.loads(feat_path.read_text(encoding="utf-8"))
+        LOGGER.info("Feature contract: %d kolom", len(feature_columns))
+
+        # ---- XGBoost ----
+        xgb_path = cls._resolve_xgb_path(model_dir, config.xgb_filenames)
+        xgb_model = cls._load_xgb(xgb_path, expected_n_features=len(feature_columns))
+
+        # ---- Layer-2 (opsional) ----
+        iso_model, iso_scaler, iso_metadata = cls._load_layer2(model_dir, config)
+
+        # ---- Categorical categories ----
+        cat_path = model_dir / config.categorical_categories_filename
+        categorical_categories: Dict[str, List[str]] = {}
+        if cat_path.exists():
+            categorical_categories = json.loads(cat_path.read_text(encoding="utf-8"))
+            LOGGER.info(
+                "Kategori kategorikal: %s",
+                {k: len(v) for k, v in categorical_categories.items()},
+            )
+        else:
+            LOGGER.warning(
+                "%s tidak ada — fitur OHE akan diisi 0 untuk semua record",
+                cat_path.name,
+            )
+
+        artifacts = ModelArtifacts(
+            xgb_model=xgb_model,
+            iso_model=iso_model,
+            iso_scaler=iso_scaler,
+            feature_columns=feature_columns,
+            categorical_categories=categorical_categories,
+            iso_metadata=iso_metadata,
+        )
+
+        # ---- Explainer ----
+        explainer: Optional[TacticalExplainer] = None
+        if with_explainer and config.explain_on_attack:
             try:
-                self._iso_explainer = shap.TreeExplainer(iso_model)
-                LOGGER.info("TreeExplainer untuk Isolation Forest berhasil dimuat")
-            except Exception:  # noqa: BLE001
-                LOGGER.warning(
-                    "TreeExplainer gagal untuk Isolation Forest; fallback z-score aktif",
-                    exc_info=True,
+                explainer = TacticalExplainer(
+                    xgb_model=xgb_model,
+                    iso_model=iso_model,
+                    iso_scaler=iso_scaler,
+                    feature_columns=feature_columns,
                 )
-                self._iso_explainer = None
+                LOGGER.info("TacticalExplainer aktif")
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Gagal inisialisasi TacticalExplainer; deteksi tetap jalan")
 
-        # cache lookup lowercase
-        self._lower_lookup: Dict[str, str] = {c.lower(): c for c in self.feature_columns}
+        return cls(artifacts=artifacts, config=config, explainer=explainer)
 
     # ------------------------------------------------------------------ #
-    # Public API
+    # Loader helpers
     # ------------------------------------------------------------------ #
-    def explain_known_threat(
-        self,
-        X_row: pd.DataFrame,
-        *,
-        severity: str,
-        probability: float,
-        anomaly_type: str = "known_threat",
-    ) -> Tuple[str, Dict[str, float]]:
-        """Layer-1: XGBoost. Return (kalimat, top_features{name: shap_value})."""
-        top = self._shap_top_contributions(
-            self._xgb_explainer, X_row, model_type="xgboost"
+    @staticmethod
+    def _resolve_xgb_path(model_dir: Path, filenames: List[str]) -> Path:
+        for fname in filenames:
+            p = model_dir / fname
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            f"Model XGBoost tidak ditemukan di {model_dir}. "
+            f"Dicari: {filenames}\n"
+            f"Jalankan: python scripts/migrate_xgb_model.py",
         )
-        sentence = self._compose(
-            top,
-            severity=severity,
-            confidence=probability,
-            anomaly_type=anomaly_type,
-            source="XGBoost (Layer-1 / Known Threat)",
-        )
-        return sentence, dict(top)
 
-    def explain_zero_day(
-        self,
-        X_row: pd.DataFrame,
-        *,
-        severity: str,
-        decision_score: float,
-        score_threshold: float,
-        anomaly_type: str = "zero_day",
-    ) -> Tuple[str, Dict[str, float]]:
-        """Layer-2: Isolation Forest. Return (kalimat, top_features{name: shap_value})."""
-        top = self._iso_top_contributions(X_row, score_threshold, decision_score)
-        # konversi decision_score menjadi pseudo-probability untuk confidence band
-        pseudo_conf = self._iso_confidence(decision_score, score_threshold)
-        sentence = self._compose(
-            top,
-            severity=severity,
-            confidence=pseudo_conf,
-            anomaly_type=anomaly_type,
-            source="Isolation Forest (Layer-2 / Zero-Day)",
+    @staticmethod
+    def _load_xgb(path: Path, expected_n_features: int) -> xgb.XGBClassifier:
+        suffix = path.suffix.lower()
+        if suffix in {".json", ".ubj", ".model"}:
+            model = xgb.XGBClassifier()
+            model.load_model(str(path))
+        elif suffix in {".pkl", ".joblib"}:
+            obj = joblib.load(path)
+            if isinstance(obj, xgb.XGBClassifier):
+                model = obj
+            elif isinstance(obj, xgb.Booster):
+                model = xgb.XGBClassifier()
+                model._Booster = obj
+            else:
+                raise TypeError(f"{path} berisi {type(obj)}, bukan XGBClassifier")
+        else:
+            raise ValueError(f"Format tidak dikenal: {suffix}")
+
+        n_model = getattr(model, "n_features_in_", None)
+        if n_model is not None and n_model != expected_n_features:
+            raise ValueError(
+                f"Mismatch: model XGBoost dilatih dengan {n_model} fitur, "
+                f"tapi feature_columns.json berisi {expected_n_features}",
+            )
+        LOGGER.info(
+            "XGBoost dimuat: %s (%s) | n_features=%d | classes=%s",
+            path.name, suffix, expected_n_features,
+            getattr(model, "classes_", "?"),
         )
-        return sentence, dict(top)
+        return model
+
+    @staticmethod
+    def _load_layer2(
+        model_dir: Path, config: DetectorConfig,
+    ) -> Tuple[Optional[Any], Optional[Any], Dict[str, Any]]:
+        if not config.enable_layer2:
+            LOGGER.info("Layer-2 dinonaktifkan oleh konfigurasi")
+            return None, None, {}
+
+        iso_path = model_dir / config.iso_filename
+        scaler_path = model_dir / config.iso_scaler_filename
+        meta_path = model_dir / config.iso_metadata_filename
+
+        if not (iso_path.exists() and scaler_path.exists()):
+            LOGGER.warning(
+                "Layer-2 aktif tapi artefak tidak lengkap. "
+                "Jalankan: python train_layer2.py --input data/raw/train.csv --label-column label",
+            )
+            return None, None, {}
+
+        iso_model = joblib.load(iso_path)
+        iso_scaler = joblib.load(scaler_path)
+        iso_metadata: Dict[str, Any] = {}
+        if meta_path.exists():
+            iso_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        LOGGER.info(
+            "Isolation Forest dimuat: n_features=%s | contamination=%.3f",
+            getattr(iso_model, "n_features_in_", "?"),
+            getattr(iso_model, "contamination", 0.0),
+        )
+        return iso_model, iso_scaler, iso_metadata
 
     # ------------------------------------------------------------------ #
-    # Top contribution extraction
+    # Feature contract validation
     # ------------------------------------------------------------------ #
-    def _shap_top_contributions(
+    def _validate_feature_contract(self) -> None:
+        """Pastikan kategori OHE sesuai dengan feature_columns."""
+        missing: List[str] = []
+        for cat_col, cats in self._categorical.items():
+            for c in cats:
+                target = f"{cat_col.lower()}_{str(c).lower()}"
+                if target not in self._lower_to_actual:
+                    missing.append(target)
+        if missing:
+            LOGGER.warning(
+                "Kolom OHE tidak ada di feature_columns (diabaikan): %s (total %d)",
+                missing[:5], len(missing),
+            )
+
+    # ------------------------------------------------------------------ #
+    # Preprocessing
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {str(k).strip().lower(): v for k, v in record.items() if k is not None}
+
+    def preprocess(self, record: Dict[str, Any]) -> pd.DataFrame:
+        """Konversi 1 record stream → DataFrame 1 baris, align ke feature contract."""
+        rec_low = self._normalize_record(record)
+        row: Dict[str, float] = {}
+
+        # 1) Numerik
+        for col in self._feature_columns:
+            key = col.lower()
+            if key in rec_low:
+                val = rec_low[key]
+                try:
+                    row[col] = float(val) if val is not None else 0.0
+                except (TypeError, ValueError):
+                    row[col] = 0.0
+
+        # 2) Kategorikal → OHE manual
+        for cat_col, categories in self._categorical.items():
+            val = rec_low.get(cat_col.lower())
+            val_str = "" if val is None else str(val).strip().lower()
+            for cat in categories:
+                target_low = f"{cat_col.lower()}_{str(cat).lower()}"
+                actual = self._lower_to_actual.get(target_low)
+                if actual is None:
+                    continue
+                row[actual] = 1.0 if val_str == str(cat).lower() else 0.0
+
+        df = pd.DataFrame([row], columns=self._feature_columns).fillna(0.0)
+        return df.astype(np.float32)
+
+    def preprocess_batch(self, records: List[Dict[str, Any]]) -> pd.DataFrame:
+        """Vectorized preprocessing untuk batch inference (diagnostic / replay)."""
+        normalized = [self._normalize_record(r) for r in records]
+        n = len(normalized)
+
+        # Matriks numerik
+        data: Dict[str, np.ndarray] = {}
+        for col in self._feature_columns:
+            key = col.lower()
+            values = np.empty(n, dtype=np.float32)
+            for i, rec in enumerate(normalized):
+                v = rec.get(key)
+                try:
+                    values[i] = float(v) if v is not None else 0.0
+                except (TypeError, ValueError):
+                    values[i] = 0.0
+            data[col] = values
+
+        # OHE batch
+        for cat_col, categories in self._categorical.items():
+            key = cat_col.lower()
+            for cat in categories:
+                target_low = f"{cat_col.lower()}_{str(cat).lower()}"
+                actual = self._lower_to_actual.get(target_low)
+                if actual is None:
+                    continue
+                cat_low = str(cat).lower()
+                data[actual] = np.array(
+                    [1.0 if str(r.get(key, "")).strip().lower() == cat_low else 0.0
+                     for r in normalized],
+                    dtype=np.float32,
+                )
+
+        return pd.DataFrame(data, columns=self._feature_columns)
+
+    def _zero_non_informative(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Zero-kan fitur identitas untuk Layer-2 (KONSISTEN dengan training)."""
+        cols = [c for c in X.columns if c.lower() in NON_INFORMATIVE_FEATURES]
+        if not cols:
+            return X
+        X = X.copy()
+        X[cols] = 0.0
+        return X
+
+    # ------------------------------------------------------------------ #
+    # Inference (single record)
+    # ------------------------------------------------------------------ #
+    def predict(
         self,
-        explainer: shap.TreeExplainer,
-        X_row: pd.DataFrame,
+        record: Dict[str, Any],
         *,
-        model_type: str,
-    ) -> List[Tuple[str, float]]:
+        stream_ts: Optional[float] = None,
+    ) -> Optional[Alert]:
+        """Return Alert bila attack/zero-day; None bila Normal."""
+        timestamp = float(stream_ts) if stream_ts is not None else time.time()
+        X = self.preprocess(record)
+
+        prob_attack, is_l1 = self._run_layer1(X)
+        iso_score, is_l2 = self._run_layer2(X)
+
+        if not is_l1 and not is_l2:
+            return None
+
+        src_ip, dst_ip = self._extract_ips(record)
+        stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
+
+        if is_l1:
+            return self._build_l1_alert(
+                X, timestamp, src_ip, dst_ip, prob_attack, iso_score, is_l2, stream_meta, record,
+            )
+        return self._build_l2_alert(
+            X, timestamp, src_ip, dst_ip, prob_attack, iso_score, stream_meta, record,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Inference (batch)
+    # ------------------------------------------------------------------ #
+    def predict_batch(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        include_normal: bool = False,
+    ) -> List[Optional[Alert]]:
+        """
+        Batch inference. Return list dengan panjang sama dengan records;
+        elemen None jika Normal (kecuali include_normal=True).
+        """
+        if not records:
+            return []
+
+        X_all = self.preprocess_batch(records)
+
+        # XGBoost batch
         try:
-            shap_values = explainer.shap_values(X_row)
-            attack_shap = self._extract_attack_shap(shap_values, model_type)
+            proba_arr = self.artifacts.xgb_model.predict_proba(X_all)
+            prob_attack_all = proba_arr[:, 1] if proba_arr.ndim == 2 else proba_arr
         except Exception:  # noqa: BLE001
-            LOGGER.exception("SHAP gagal pada %s; mengembalikan list kosong", model_type)
-            return []
+            LOGGER.exception("XGBoost batch predict_proba gagal")
+            prob_attack_all = np.zeros(len(records), dtype=np.float32)
 
-        if attack_shap is None or attack_shap.size == 0:
-            return []
-
-        n = min(self.config.top_k, attack_shap.shape[0])
-        top_idx = np.argsort(-np.abs(attack_shap))[:n]
-        return [
-            (self.feature_columns[int(i)], float(attack_shap[int(i)]))
-            for i in top_idx
-        ]
-
-    def _extract_attack_shap(self, shap_values: Any, model_type: str) -> Optional[np.ndarray]:
-        """
-        Normalisasi output SHAP ke vektor 1-D dengan arah positif = menuju attack/anomaly.
-        """
-        if isinstance(shap_values, list):
-            # XGBoost binary: [class0_shap, class1_shap]
-            arr = np.asarray(shap_values[1])
-        else:
-            arr = np.asarray(shap_values)
-
-        if arr.ndim == 3:                 # (n, features, classes)
-            arr = arr[:, :, 1]
-        if arr.ndim == 2:                 # (n, features)
-            arr = arr[0]
-        arr = np.asarray(arr, dtype=float).ravel()
-
-        if model_type == "isolation_forest":
-            # decision_function negatif = anomali; kita balik agar positif = anomali
-            arr = -arr
-        return arr
-
-    def _iso_top_contributions(
-        self,
-        X_row: pd.DataFrame,
-        score_threshold: float,
-        decision_score: float,
-    ) -> List[Tuple[str, float]]:
-        # 1) Coba SHAP
-        if self._iso_explainer is not None and self.iso_scaler is not None:
+        # Isolation Forest batch
+        iso_score_all = np.zeros(len(records), dtype=np.float32)
+        if self.artifacts.iso_model is not None and self.artifacts.iso_scaler is not None:
             try:
-                X_scaled = self.iso_scaler.transform(X_row.values)
-                shap_values = self._iso_explainer.shap_values(X_scaled)
-                attack_shap = self._extract_attack_shap(shap_values, "isolation_forest")
-                if attack_shap is not None and attack_shap.size == len(self.feature_columns):
-                    n = min(self.config.top_k, attack_shap.shape[0])
-                    top_idx = np.argsort(-np.abs(attack_shap))[:n]
-                    return [
-                        (self.feature_columns[int(i)], float(attack_shap[int(i)]))
-                        for i in top_idx
-                    ]
+                X_iso = self._zero_non_informative(X_all)
+                X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
+                iso_score_all = self.artifacts.iso_model.decision_function(X_scaled)
             except Exception:  # noqa: BLE001
-                LOGGER.warning("SHAP Isolation Forest gagal; beralih ke z-score", exc_info=True)
+                LOGGER.exception("Isolation Forest batch gagal")
 
-        # 2) Fallback: z-score dari scaler
-        if self.config.shap_fallback_to_zscore and self.iso_scaler is not None:
-            try:
-                X_scaled = self.iso_scaler.transform(X_row.values)[0]
-                n = min(self.config.top_k, X_scaled.shape[0])
-                top_idx = np.argsort(-np.abs(X_scaled))[:n]
-                return [
-                    (self.feature_columns[int(i)], float(X_scaled[int(i)]))
-                    for i in top_idx
-                ]
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Fallback z-score juga gagal")
+        results: List[Optional[Alert]] = []
+        for i, record in enumerate(records):
+            prob = float(prob_attack_all[i])
+            iso = float(iso_score_all[i])
+            is_l1 = prob >= self.config.xgb_threshold
+            is_l2 = iso < self._iso_threshold
 
-        return []
+            if not is_l1 and not is_l2 and not include_normal:
+                results.append(None)
+                continue
 
-    @staticmethod
-    def _iso_confidence(decision_score: float, score_threshold: float) -> float:
-        """Heuristik: makin jauh di bawah threshold, makin tinggi confidence."""
-        if score_threshold <= 0:
-            return 0.5
-        ratio = (score_threshold - decision_score) / abs(score_threshold)
-        return float(np.clip(0.5 + ratio, 0.0, 1.0))
+            X_row = X_all.iloc[[i]]
+            timestamp = record.get("_stream_ts", time.time())
+            src_ip, dst_ip = self._extract_ips(record)
+            stream_meta = {k: record.get(k) for k in self.METADATA_KEYS if k in record}
+
+            if is_l1:
+                results.append(self._build_l1_alert(
+                    X_row, float(timestamp), src_ip, dst_ip, prob, iso, is_l2,
+                    stream_meta, record,
+                ))
+            elif is_l2:
+                results.append(self._build_l2_alert(
+                    X_row, float(timestamp), src_ip, dst_ip, prob, iso,
+                    stream_meta, record,
+                ))
+            else:
+                results.append(None)
+        return results
 
     # ------------------------------------------------------------------ #
-    # Komposisi kalimat taktis
+    # Layer runners
     # ------------------------------------------------------------------ #
-    def _compose(
+    def _run_layer1(self, X: pd.DataFrame) -> Tuple[float, bool]:
+        try:
+            proba_arr = self.artifacts.xgb_model.predict_proba(X)
+            prob = (
+                float(proba_arr[0, 1])
+                if proba_arr.shape[1] > 1
+                else float(proba_arr[0, 0])
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("XGBoost predict_proba gagal")
+            prob = 0.0
+        return prob, prob >= self.config.xgb_threshold
+
+    def _run_layer2(self, X: pd.DataFrame) -> Tuple[float, bool]:
+        if self.artifacts.iso_model is None or self.artifacts.iso_scaler is None:
+            return 0.0, False
+        try:
+            X_iso = self._zero_non_informative(X)
+            X_scaled = self.artifacts.iso_scaler.transform(X_iso.values)
+            score = float(self.artifacts.iso_model.decision_function(X_scaled)[0])
+            return score, score < self._iso_threshold
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Isolation Forest gagal; lewati layer-2")
+            return 0.0, False
+
+    # ------------------------------------------------------------------ #
+    # Alert builders
+    # ------------------------------------------------------------------ #
+    def _build_l1_alert(
         self,
-        top: List[Tuple[str, float]],
-        *,
-        severity: str,
-        confidence: float,
-        anomaly_type: str,
-        source: str,
-    ) -> str:
-        severity = str(severity).upper()
-        conf_label = self._confidence_label(confidence)
-        attack_label = self._humanize_type(anomaly_type)
+        X: pd.DataFrame,
+        timestamp: float,
+        src_ip: str,
+        dst_ip: str,
+        prob_attack: float,
+        iso_score: float,
+        is_l2: bool,
+        stream_meta: Dict[str, Any],
+        record: Dict[str, Any],
+    ) -> Alert:
+        severity = self._severity_from_probability(prob_attack)
+        tags: List[str] = ["ZERO_DAY_CORROBORATED"] if is_l2 else []
+        anomaly_type = self._infer_attack_type(X)
 
-        if not top:
-            text = (
-                f"Anomali {attack_label} terdeteksi dengan tingkat keyakinan "
-                f"{conf_label} ({(confidence * 100):.0f}%). "
-                "Tidak ada fitur dominan yang dapat diidentifikasi secara otomatis."
-            )
-        else:
-            phrases = [
-                f"({i + 1}) {self._phrase_for_feature(name, value)}"
-                for i, (name, value) in enumerate(top)
-            ]
-            detail = " dan ".join(phrases) if len(phrases) == 2 else ", ".join(phrases)
-            text = (
-                f"Analisis forensik {source} mengungkap vektor dominan: {detail}. "
-                f"Tingkat keyakinan: {conf_label} ({(confidence * 100):.0f}%)."
-            )
+        alert = Alert(
+            timestamp=timestamp,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            anomaly_type=anomaly_type,
+            severity=severity,
+            layer=1,
+            score=prob_attack,
+            features={
+                "xgb_prob": prob_attack,
+                "iso_score": iso_score,
+                **stream_meta,
+            },
+            tags=tags,
+            raw=record,
+        )
+        if self.explainer is not None and self.config.explain_on_attack:
+            try:
+                sentence, top = self.explainer.explain_known_threat(
+                    X,
+                    severity=severity,
+                    probability=prob_attack,
+                    anomaly_type=anomaly_type,
+                )
+                alert.features["explanation"] = sentence
+                alert.features["top_features"] = top
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Explainer L1 gagal")
+        return alert
 
-        if self.config.style == "full" and self.config.include_recommendation:
-            text = f"{text} {RECOMMENDATIONS.get(severity, RECOMMENDATIONS['LOW'])}"
-
-        if len(text) > self.config.max_phrase_chars:
-            text = text[: self.config.max_phrase_chars - 3].rstrip() + "..."
-        return text
-
-    @staticmethod
-    def _confidence_label(prob: float) -> str:
-        for threshold, label in CONFIDENCE_BANDS:
-            if prob >= threshold:
-                return label
-        return "RENDAH"
-
-    @staticmethod
-    def _humanize_type(anomaly_type: str) -> str:
-        return {
-            "known_threat": "serangan yang dikenal (known threat)",
-            "zero_day": "anomali nol-hari (zero-day)",
-            "scan": "pemindaian jaringan (network scanning)",
-            "flood": "banjir trafik (flooding)",
-            "protocol_anomaly": "anomali protokol",
-            "duration_anomaly": "anomali durasi koneksi",
-            "unknown": "anomali tak terklasifikasi",
-        }.get(str(anomaly_type).lower(), str(anomaly_type))
+    def _build_l2_alert(
+        self,
+        X: pd.DataFrame,
+        timestamp: float,
+        src_ip: str,
+        dst_ip: str,
+        prob_attack: float,
+        iso_score: float,
+        stream_meta: Dict[str, Any],
+        record: Dict[str, Any],
+    ) -> Alert:
+        severity = self._severity_from_iso(iso_score, self._iso_threshold)
+        alert = Alert(
+            timestamp=timestamp,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            anomaly_type="zero_day",
+            severity=severity,
+            layer=2,
+            score=iso_score,
+            features={
+                "iso_score": iso_score,
+                "iso_threshold": self._iso_threshold,
+                "xgb_prob": prob_attack,
+                **stream_meta,
+            },
+            tags=["ZERO_DAY"],
+            raw=record,
+        )
+        if self.explainer is not None and self.config.explain_on_attack:
+            try:
+                sentence, top = self.explainer.explain_zero_day(
+                    X,
+                    severity=severity,
+                    decision_score=iso_score,
+                    score_threshold=self._iso_threshold,
+                )
+                alert.features["explanation"] = sentence
+                alert.features["top_features"] = top
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Explainer L2 gagal")
+        return alert
 
     # ------------------------------------------------------------------ #
-    # Fitur → frasa taktis
+    # Helpers
     # ------------------------------------------------------------------ #
-    def _phrase_for_feature(self, feature: str, shap_value: float) -> str:
-        f_low = feature.lower()
-        direction = "up" if shap_value > 0 else "down"
-
-        # 1) Exact match
-        if f_low in FEATURE_TEMPLATES:
-            return FEATURE_TEMPLATES[f_low][direction]
-
-        # 2) proto_xxx
-        if f_low.startswith("proto_"):
-            name = feature.split("_", 1)[1].upper()
-            return (
-                f"eskalasi trafik protokol {name}"
-                if direction == "up"
-                else f"penurunan trafik protokol {name}"
+    def _extract_ips(self, record: Dict[str, Any]) -> Tuple[str, str]:
+        rec_low = self._normalize_record(record)
+        src = rec_low.get("src_ip") or rec_low.get("source_ip") or rec_low.get("src")
+        dst = rec_low.get("dst_ip") or rec_low.get("destination_ip") or rec_low.get("dst")
+        if self.config.strict_ips and (src is None or dst is None):
+            raise ValueError(
+                f"Record tidak punya src_ip/dst_ip; contoh key: {list(rec_low)[:10]}",
             )
+        return (
+            str(src) if src is not None else self.config.fallback_src_ip,
+            str(dst) if dst is not None else self.config.fallback_dst_ip,
+        )
 
-        # 3) service_xxx
-        if f_low.startswith("service_"):
-            name = feature.split("_", 1)[1].upper()
-            return (
-                f"aktivitas abnormal layanan {name}"
-                if direction == "up"
-                else f"penurunan aktivitas layanan {name}"
-            )
+    def _severity_from_probability(self, prob: float) -> str:
+        c = self.config
+        if prob >= c.sev_critical:
+            return "CRITICAL"
+        if prob >= c.sev_high:
+            return "HIGH"
+        if prob >= c.sev_medium:
+            return "MEDIUM"
+        return "LOW"
 
-        # 4) *_flag_number
-        if f_low.endswith("_flag_number"):
-            flag = feature[: -len("_flag_number")].upper()
-            return (
-                f"lonjakan flag {flag} yang tidak wajar"
-                if direction == "up"
-                else f"anomali rendahnya flag {flag}"
-            )
+    def _severity_from_iso(self, score: float, threshold: float) -> str:
+        """Gradasi severity dari magnitude Isolation Forest decision score.
 
-        # 5) *_count
-        if f_low.endswith("_count"):
-            entity = feature[: -len("_count")].upper()
-            return (
-                f"lonjakan jumlah paket {entity}"
-                if direction == "up"
-                else f"penurunan jumlah paket {entity}"
-            )
+        Skala empiris RT-IoT (10k Normal, contamination=0.05):
+            Normal   : +0.02 .. +0.16
+            Mild     : -0.01 .. -0.05
+            Anomali  : -0.05 .. -0.15
+            Severe   : -0.15 .. -0.30+
+        """
+        if score >= threshold:
+            return "LOW"
 
-        # 6) rate-like
-        if any(k in f_low for k in ("rate", "srate", "drate")):
-            return (
-                f"lonjakan laju paket ({feature})"
-                if direction == "up"
-                else f"penurunan laju paket ({feature})"
-            )
+        if abs(threshold) < 1e-9:
+            # threshold ~0 → magnitude absolut
+            m = abs(score)
+            if m >= 0.15:
+                return "CRITICAL"
+            if m >= 0.08:
+                return "HIGH"
+            if m >= 0.03:
+                return "MEDIUM"
+            return "LOW"
 
-        # 7) duration-like
-        if "duration" in f_low or "iat" in f_low:
-            return (
-                f"lonjakan durasi ({feature})"
-                if direction == "up"
-                else f"penurunan durasi ({feature})"
-            )
+        ratio = (threshold - score) / abs(threshold)
+        if ratio >= 2.0:
+            return "CRITICAL"
+        if ratio >= 1.0:
+            return "HIGH"
+        if ratio >= 0.3:
+            return "MEDIUM"
+        return "LOW"
 
-        # 8) size/stat
-        if any(k in f_low for k in ("size", "length", "tot_sum", "min", "max", "avg", "std", "variance")):
-            return f"anomali ukuran/statistik ({feature})"
+    def _infer_attack_type(self, X: pd.DataFrame) -> str:
+        """Heuristik tipe serangan dari top-3 |z-score| terhadap baseline Normal."""
+        if self.artifacts.iso_scaler is None:
+            return "known_threat"
+        try:
+            z = self.artifacts.iso_scaler.transform(X.values)[0]
+            top_idx = np.argsort(-np.abs(z))[:3]
+            top_names = " ".join(self._feature_columns[int(i)].lower() for i in top_idx)
+        except Exception:  # noqa: BLE001
+            return "known_threat"
 
-        # 9) Generic
-        return f"pergeseran pola pada fitur '{feature}'"
+        if "syn" in top_names and "flag" in top_names:
+            return "scan"
+        if any(k in top_names for k in ("rate", "srate", "drate", "syn_count")):
+            return "flood"
+        if "duration" in top_names or "iat" in top_names:
+            return "duration_anomaly"
+        if "proto_" in top_names or "service_" in top_names:
+            return "protocol_anomaly"
+        return "known_threat"

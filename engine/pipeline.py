@@ -91,7 +91,7 @@ class GarudaPipeline:
         LOGGER.info("Membangun pipeline: model_dir=%s stream=%s",
                     config.model_dir, config.stream_csv)
 
-        detector = DualLayerDetector.load(config.detector_config, with_explainer=True)
+        detector = DualLayerDetector.load(config.detector_config, with_explainer=False)
         triage = TriageEngine(config.triage_config)
         streamer = StreamGenerator(StreamConfig(
             csv_path=config.stream_csv,

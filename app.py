@@ -4,8 +4,8 @@ app.py
 ======
 GARUDA SENTINEL — Local Tactical Interface (Streamlit SOC).
 
-Jalankan:
-    python -m streamlit run app.py
+Jalankan menggunakan path Python yang benar:
+    & 'C:\\Program Files\\Python313\\python.exe' -m streamlit run app.py
 """
 from __future__ import annotations
 
@@ -41,8 +41,9 @@ LOGGER = logging.getLogger("garuda.app")
 # --------------------------------------------------------------------------- #
 # Konstanta
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL_DIR = "models"
-DEFAULT_STREAM_CSV = "data/processed/simulation_stream.csv"
+# HACKATHON MODE: Menggunakan folder bawaan dan simulasi serangan
+DEFAULT_MODEL_DIR = "models" 
+DEFAULT_STREAM_CSV = "data/processed/simulation_stream.csv" 
 DEFAULT_DELAY_MS = 200
 SEVERITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
@@ -52,7 +53,7 @@ SEVERITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 # --------------------------------------------------------------------------- #
 st.set_page_config(
     page_title="GARUDA SENTINEL · Tactical SOC",
-    page_icon="🛡",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -72,8 +73,8 @@ def _build_pipeline(model_dir: str, stream_csv: str, delay_ms: int) -> GarudaPip
             model_dir=Path(model_dir),
             strict_ips=False,
             xgb_threshold=0.5,
-            enable_layer2=True,
-            explain_on_attack=True,
+            enable_layer2=True,   # AKTIFKAN UNTUK ZERO-DAY DETECTION
+            explain_on_attack=False, # MATIKAN UNTUK MENCEGAH CIRCULAR IMPORT
             iso_threshold_override=0.037,
         ),
     )
@@ -200,7 +201,7 @@ def _handle_action(pipeline: GarudaPipeline, result: dict, card: dict) -> None:
         st.toast(f"🚨 Aset {card['dst_ip']} DIISOLASI oleh {operator}", icon="🚨")
     elif action == "ACK":
         pipeline.acknowledge(cid, operator=operator)
-        st.toast(f"✓ Kartu {cid} di-acknowledge", icon="✓")
+        st.toast(f"Kartu {cid} di-acknowledge", icon="✅")
     st.rerun()
 
 
@@ -210,9 +211,27 @@ def _handle_action(pipeline: GarudaPipeline, result: dict, card: dict) -> None:
 def main() -> None:
     _init_state()
 
+    # --- FITUR UJI COBA LIVE (HACKATHON MODE) ---
+    with st.sidebar:
+        st.markdown("### 📂 UJI DATA KUSTOM (JURI)")
+        uploaded_file = st.file_uploader("Unggah file CSV lalu lintas jaringan:", type=["csv"])
+        
+        if uploaded_file is not None:
+            # Simpan file upload dari juri ke sistem lokal sementara
+            custom_path = "data/processed/custom_juri_stream.csv"
+            with open(custom_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            active_stream_csv = custom_path
+            st.success("✅ Data juri berhasil dimuat dan siap dianalisis!")
+        else:
+            # Jika tidak ada file yang diunggah, gunakan simulasi bawaan
+            active_stream_csv = DEFAULT_STREAM_CSV
+    # --------------------------------------------
+
     try:
+        # Gunakan 'active_stream_csv' yang nilainya dinamis
         pipeline = _build_pipeline(
-            DEFAULT_MODEL_DIR, DEFAULT_STREAM_CSV, DEFAULT_DELAY_MS
+            DEFAULT_MODEL_DIR, active_stream_csv, DEFAULT_DELAY_MS
         )
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Gagal inisialisasi pipeline: {exc}")
@@ -229,6 +248,7 @@ def main() -> None:
             pipeline.start()
         st.session_state["auto_started"] = True
 
+    # Render sisa menu sidebar (Kontrol Sistem, Operator, dll) di bawah uploader
     _render_sidebar(pipeline)
 
     # ---- Dashboard ----
